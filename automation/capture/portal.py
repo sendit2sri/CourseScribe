@@ -379,6 +379,154 @@ class PortalNavigator:
         return result
 
     # ------------------------------------------------------------------
+    # Step 6b: Extract curriculum from sidebar
+    # ------------------------------------------------------------------
+
+    async def extract_curriculum_from_page(self) -> dict:
+        """Extract the curriculum sidebar data from the current page.
+
+        Should be called after launch_course(), when the curriculum
+        sidebar is visible. Uses Playwright Locators to read the tree
+        items directly from the live DOM.
+
+        Returns:
+            Dict with course_name, course_code, progress, items, etc.
+            Same structure as extract_courses.extract_curriculum().
+        """
+        page = self.session.page
+
+        # Course title
+        course_title = ""
+        title_sel = self.selectors.get("curriculum_title")
+        if title_sel:
+            title_loc = page.locator(title_sel).first
+            if await title_loc.count() > 0:
+                course_title = (await title_loc.inner_text()).strip()
+
+        # Extract course code from title
+        course_name = course_title
+        course_code = ""
+        if course_title:
+            import re
+            code_match = re.search(r'\s+([A-Z]{2,4}\d[A-Z]{2,5}\d*)\s*$', course_title)
+            if code_match:
+                course_code = code_match.group(1)
+                course_name = course_title[:code_match.start()].strip()
+
+        # Progress percentage
+        progress_pct = ""
+        pct_sel = self.selectors.get("curriculum_progress_pct")
+        if pct_sel:
+            pct_loc = page.locator(pct_sel).first
+            if await pct_loc.count() > 0:
+                progress_pct = (await pct_loc.inner_text()).strip()
+
+        # Progress count (e.g., "20/20")
+        progress_count = ""
+        count_sel = self.selectors.get("curriculum_progress_count")
+        if count_sel:
+            count_loc = page.locator(count_sel).first
+            if await count_loc.count() > 0:
+                progress_count = (await count_loc.inner_text()).strip()
+
+        # Overall status
+        overall_status = ""
+        status_sel = self.selectors.get("curriculum_status")
+        if status_sel:
+            status_loc = page.locator(status_sel).first
+            if await status_loc.count() > 0:
+                overall_status = (await status_loc.inner_text()).strip()
+
+        # Total duration
+        total_duration = ""
+        dur_sel = self.selectors.get("curriculum_duration")
+        if dur_sel:
+            dur_loc = page.locator(dur_sel).first
+            if await dur_loc.count() > 0:
+                total_duration = (await dur_loc.inner_text()).strip()
+
+        # Training items from tree
+        items = []
+        item_sel = self.selectors.get("curriculum_tree_item")
+        if item_sel:
+            tree_items = page.locator(item_sel)
+            item_count = await tree_items.count()
+
+            for i in range(item_count):
+                item = tree_items.nth(i)
+
+                node_id = await item.get_attribute("data-node-id") or ""
+                position = await item.get_attribute("aria-posinset") or ""
+                total = await item.get_attribute("aria-setsize") or ""
+
+                # Title from .titles element
+                title = ""
+                title_item_sel = self.selectors.get("curriculum_item_title")
+                if title_item_sel:
+                    titles_el = item.locator(title_item_sel).first
+                    if await titles_el.count() > 0:
+                        title = await titles_el.get_attribute("content") or ""
+                        if not title:
+                            title = await titles_el.get_attribute("aria-label") or ""
+                        if not title:
+                            title = (await titles_el.inner_text()).strip()
+                title = title.strip()
+
+                # Completion status
+                status = "not_started"
+                completed_sel = self.selectors.get("curriculum_item_completed")
+                in_progress_sel = self.selectors.get("curriculum_item_in_progress")
+
+                if completed_sel and await item.locator(completed_sel).count() > 0:
+                    status = "completed"
+                elif in_progress_sel and await item.locator(in_progress_sel).count() > 0:
+                    status = "in_progress"
+
+                # Duration
+                duration = ""
+                due_el = item.locator(".dueDate").first
+                if await due_el.count() > 0:
+                    duration = (await due_el.inner_text()).strip()
+
+                if not title:
+                    continue
+
+                items.append({
+                    "position": int(position) if position else 0,
+                    "total": int(total) if total else 0,
+                    "title": title,
+                    "status": status,
+                    "duration": duration,
+                    "node_id": node_id,
+                })
+
+        completed = sum(1 for it in items if it["status"] == "completed")
+        in_progress = sum(1 for it in items if it["status"] == "in_progress")
+        not_started = sum(1 for it in items if it["status"] == "not_started")
+
+        result = {
+            "course_name": course_name,
+            "course_code": course_code,
+            "overall_status": overall_status,
+            "progress": progress_pct,
+            "progress_count": progress_count,
+            "total_duration": total_duration,
+            "summary": {
+                "total_items": len(items),
+                "completed": completed,
+                "in_progress": in_progress,
+                "not_started": not_started,
+            },
+            "items": items,
+        }
+
+        logger.info(
+            "Extracted curriculum: %s (%s) — %d items (%d completed, %d in progress)",
+            course_name, course_code, len(items), completed, in_progress,
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Step 7: Detect content frame
     # ------------------------------------------------------------------
 

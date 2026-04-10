@@ -79,6 +79,18 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "chapter_root_title": ".titlesNew h1, .titlesNew",
     "chapter_item_title": ".titles div, .titles",
 
+    # ---- Curriculum sidebar extraction ----
+    "curriculum_sidebar": ".sidebarGenericPlayerMFE, .toc-container, [id='rcl$sidePanel__main']",
+    "curriculum_title": "h1.titleName",
+    "curriculum_progress_pct": ".curriculumProgressPercentage",
+    "curriculum_progress_count": '[data-testid="$rcl-baseElement"]',
+    "curriculum_status": ".curriculumSummaryStatus",
+    "curriculum_duration": '[data-testid="curriculumPlayer$totalDuration_Value"]',
+    "curriculum_tree_item": '[role="treeitem"][aria-level="2"]',
+    "curriculum_item_title": ".titles",
+    "curriculum_item_completed": 'lego-icon[data-icon-name="circle-check"]',
+    "curriculum_item_in_progress": 'lego-icon[data-icon-name="circle-50"]',
+
     # ---- Content frame detection ----
     "content_iframe": "iframe[src*='course'], iframe[name*='content'], iframe.course-frame",
 }
