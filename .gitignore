@@ -3,8 +3,10 @@ venv/
 .venv/
 env/
 
-# Environment variables
+# Environment variables (contains credentials — never commit)
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -24,6 +26,12 @@ cost_data.json
 # Automation output (generated at runtime)
 course_capture/
 browser_profile/
+.coursescribe/
+
+# Automation state files (contain URLs, page data)
+run_state.json
+manifest.json
+needs_review/
 
 # OS
 .DS_Store

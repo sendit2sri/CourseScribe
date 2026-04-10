@@ -2,11 +2,15 @@
 
 Uses chromium.launch_persistent_context() so the user logs in once
 and cookies/session are reused across runs.
+
+Login strategy (priority order):
+  1. Persistent browser profile — reuses saved session/cookies
+  2. Auto-login with credentials from .env — when session expired
+  3. Manual login pause — when auto-login fails or MFA/CAPTCHA appears
 """
 
 import asyncio
 import logging
-from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import (
@@ -19,6 +23,36 @@ from playwright.async_api import (
 from automation.config import AutomationConfig
 
 logger = logging.getLogger(__name__)
+
+# Common selectors for login form elements (tried in order)
+_USERNAME_SELECTORS = [
+    "input[name='username']",
+    "input[name='email']",
+    "input[name='login']",
+    "input[name='user']",
+    "input[name='userId']",
+    "input[type='email']",
+    "input[id='username']",
+    "input[id='email']",
+    "input[id='login']",
+]
+
+_PASSWORD_SELECTORS = [
+    "input[name='password']",
+    "input[name='passwd']",
+    "input[type='password']",
+    "input[id='password']",
+]
+
+_SUBMIT_SELECTORS = [
+    "button[type='submit']",
+    "input[type='submit']",
+    "button:has-text('Log in')",
+    "button:has-text('Login')",
+    "button:has-text('Sign in')",
+    "button:has-text('Sign In')",
+    "button:has-text('Submit')",
+]
 
 
 class BrowserSession:
@@ -53,32 +87,160 @@ class BrowserSession:
             self._page = await self._context.new_page()
 
         logger.info(
-            f"Browser started (headless={self.config.headless}, "
-            f"profile={self.config.browser_data_dir})"
+            "Browser started (headless=%s, profile=%s)",
+            self.config.headless,
+            self.config.browser_data_dir,
         )
         return self
 
-    async def login_flow(self) -> None:
-        """Open browser for manual login.
+    # ------------------------------------------------------------------
+    # Session validation
+    # ------------------------------------------------------------------
 
-        Navigates to start_url, then waits for the user to complete login.
-        The user presses Enter in the terminal when done.
-        Session cookies are automatically persisted in the browser profile.
+    async def is_session_valid(self) -> bool:
+        """Check if the current browser session is still authenticated.
+
+        Navigates to start_url and checks whether we land on a login page
+        (detected by the presence of a password input field).
+        Returns True if session appears valid (no login form visible).
+        """
+        if not self._page:
+            return False
+
+        url = self.config.start_url or self.config.login_url
+        if not url:
+            logger.debug("No URL to validate session against")
+            return True  # assume valid if we can't check
+
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)  # brief settle
+
+            # If a password field is visible, we're on a login page
+            for sel in _PASSWORD_SELECTORS:
+                el = await self._page.query_selector(sel)
+                if el and await el.is_visible():
+                    logger.info("Session expired — login page detected")
+                    return False
+
+            logger.info("Session valid — no login page detected")
+            return True
+        except Exception as e:
+            logger.warning("Session validation error: %s", e)
+            return False
+
+    # ------------------------------------------------------------------
+    # Login flows
+    # ------------------------------------------------------------------
+
+    async def login_flow(self) -> None:
+        """Smart login flow.
+
+        Strategy:
+          1. Navigate to login URL
+          2. If credentials in .env -> attempt auto-login
+          3. If auto-login fails or MFA/CAPTCHA appears -> pause for manual completion
+          4. Session cookies are automatically persisted in the browser profile
         """
         if not self._page:
             await self.start()
 
-        url = self.config.start_url
-        if url:
-            logger.info(f"Navigating to {url} for login...")
-            await self._page.goto(url, wait_until="domcontentloaded")
+        login_url = self.config.effective_login_url
+        if login_url:
+            logger.info("Navigating to login page...")
+            await self._page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
         else:
-            logger.info("Browser opened. Navigate to the course login page.")
+            logger.info("No login URL configured. Browser opened for manual navigation.")
 
+        # Attempt auto-login if credentials are available
+        if self.config.has_credentials:
+            auto_success = await self._try_auto_login()
+            if auto_success:
+                return
+            # Auto-login didn't fully succeed — fall through to manual
+            logger.info("Auto-login incomplete — manual intervention may be needed")
+
+        # Manual login fallback
+        await self._manual_login_prompt()
+
+    async def _try_auto_login(self) -> bool:
+        """Attempt to fill and submit the login form using .env credentials.
+
+        Returns True if login appears successful (no password field visible
+        after submission). Returns False if:
+          - Login form not found
+          - MFA/CAPTCHA page appears after submit
+          - Still on login page after submit
+        """
+        username = self.config.login_username
+        password = self.config.login_password
+        masked = self.config.masked_username()
+        logger.info("Attempting auto-login as %s...", masked)
+
+        # Find username field
+        username_el = await self._find_first_visible(self._page, _USERNAME_SELECTORS)
+        if not username_el:
+            logger.warning("Username field not found — cannot auto-login")
+            return False
+
+        # Find password field
+        password_el = await self._find_first_visible(self._page, _PASSWORD_SELECTORS)
+        if not password_el:
+            logger.warning("Password field not found — cannot auto-login")
+            return False
+
+        # Fill credentials
+        await username_el.click()
+        await username_el.fill(username)
+        await password_el.click()
+        await password_el.fill(password)
+
+        # Find and click submit
+        submit_el = await self._find_first_visible(self._page, _SUBMIT_SELECTORS)
+        if submit_el:
+            await submit_el.click()
+        else:
+            # Fallback: press Enter on the password field
+            await password_el.press("Enter")
+
+        # Wait for navigation after submit
+        try:
+            await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)  # settle for redirects
+        except Exception:
+            pass
+
+        # Check if login succeeded: no password field visible means success
+        pw_still_visible = await self._find_first_visible(self._page, _PASSWORD_SELECTORS)
+        if pw_still_visible:
+            # Still on login page — could be wrong creds, MFA, or CAPTCHA
+            logger.info("Still on login page after auto-submit — may need manual input")
+            return False
+
+        current_url = self._page.url
+        logger.info("Auto-login successful. Current URL: %s", current_url)
+        print(f"\nAuto-login successful as {masked}")
+        print(f"Session saved to: {self.config.browser_data_dir}")
+        print(f"Current URL: {current_url}")
+        return True
+
+    async def _manual_login_prompt(self) -> None:
+        """Pause and wait for user to complete login manually.
+
+        Used when:
+          - No credentials in .env
+          - Auto-login failed (wrong creds, MFA, CAPTCHA, etc.)
+        """
         print("\n" + "=" * 60)
         print("MANUAL LOGIN REQUIRED")
         print("=" * 60)
-        print("1. Log in to the course platform in the browser window")
+        if self.config.has_credentials:
+            print("Auto-login could not complete (MFA, CAPTCHA, or other challenge).")
+            print("Please complete the login in the browser window.")
+        else:
+            print("No credentials found in .env file.")
+            print("1. Log in to the course platform in the browser window")
         print("2. Navigate to the course you want to capture")
         print("3. Press ENTER here when you are logged in and ready")
         print("=" * 60)
@@ -88,10 +250,54 @@ class BrowserSession:
         await loop.run_in_executor(None, input, "Press ENTER when login is complete... ")
 
         current_url = self._page.url
-        logger.info(f"Login flow complete. Current URL: {current_url}")
+        logger.info("Manual login complete. Current URL: %s", current_url)
         print(f"\nSession saved to: {self.config.browser_data_dir}")
         print(f"Current URL: {current_url}")
         print("You can now run capture/run commands without logging in again.")
+
+    # ------------------------------------------------------------------
+    # Ensure authenticated (used by capture/run commands)
+    # ------------------------------------------------------------------
+
+    async def ensure_authenticated(self) -> None:
+        """Verify session is valid; re-login if not.
+
+        Called at the start of capture/run commands to handle expired sessions
+        transparently.
+        """
+        if await self.is_session_valid():
+            logger.info("Existing session is valid")
+            return
+
+        logger.info("Session expired — attempting re-login")
+        # Navigate to login page
+        login_url = self.config.effective_login_url
+        if login_url:
+            await self._page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+
+        # Try auto-login first, then manual fallback
+        if self.config.has_credentials:
+            if await self._try_auto_login():
+                return
+
+        await self._manual_login_prompt()
+
+    # ------------------------------------------------------------------
+    # Helper: find first visible element from a list of selectors
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _find_first_visible(page: Page, selectors: list) -> Optional[object]:
+        """Try each selector in order, return first visible element or None."""
+        for sel in selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    return el
+            except Exception:
+                continue
+        return None
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
         """Navigate to a URL and wait for initial load."""

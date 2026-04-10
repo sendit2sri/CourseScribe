@@ -44,9 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING"], default="INFO")
     common.add_argument("--log-file", type=Path, default=None)
 
-    # Browser arguments
+    # Browser arguments (--start-url optional; falls back to COURSESCRIBE_START_URL in .env)
     browser_args = argparse.ArgumentParser(add_help=False)
-    browser_args.add_argument("--start-url", required=True, help="Course starting URL")
+    browser_args.add_argument("--start-url", default=None, help="Course starting URL (or set COURSESCRIBE_START_URL in .env)")
+    browser_args.add_argument("--login-url", default=None, help="Login page URL (or set COURSESCRIBE_LOGIN_URL in .env)")
     browser_args.add_argument("--browser-data", type=Path, default=None,
                               help="Browser profile directory")
     browser_args.add_argument("--headless", action="store_true", help="Run browser headless")
@@ -112,18 +113,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def args_to_config(args: argparse.Namespace) -> AutomationConfig:
-    """Convert parsed CLI arguments to AutomationConfig."""
+    """Convert parsed CLI arguments to AutomationConfig.
+
+    Priority order:
+      1. Explicit CLI args (highest)
+      2. .env file (loaded by config.load_from_env)
+      3. Dataclass defaults (lowest)
+    """
     config = AutomationConfig()
+
+    # Load .env defaults FIRST (CLI args override below)
+    config.load_from_env()
+
+    # Common args
     config.output_dir = args.output_dir
     config.log_level = args.log_level
     config.log_file = args.log_file
 
-    if hasattr(args, "start_url"):
+    # Browser args — only override if explicitly provided on CLI
+    if hasattr(args, "start_url") and args.start_url is not None:
         config.start_url = args.start_url
-    if hasattr(args, "browser_data") and args.browser_data:
+    if hasattr(args, "login_url") and args.login_url is not None:
+        config.login_url = args.login_url
+    if hasattr(args, "browser_data") and args.browser_data is not None:
         config.browser_data_dir = args.browser_data
-    if hasattr(args, "headless"):
-        config.headless = args.headless
+    if hasattr(args, "headless") and args.headless:
+        config.headless = True
+
+    # AI args
     if hasattr(args, "provider"):
         config.ai_provider = args.provider
     if hasattr(args, "model"):
@@ -132,6 +149,8 @@ def args_to_config(args: argparse.Namespace) -> AutomationConfig:
         config.content_type = args.content_type
     if hasattr(args, "cost_tracking"):
         config.enable_cost_tracking = args.cost_tracking
+
+    # Capture args
     if hasattr(args, "enable_crops"):
         config.enable_crops = args.enable_crops
     if hasattr(args, "capture_mode"):
@@ -336,6 +355,9 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
 
     try:
         await session.start()
+
+        # Verify session is authenticated; re-login if expired
+        await session.ensure_authenticated()
 
         navigator = CourseNavigator(session, selectors)
         capturer = ScreenshotCapture(session, config, selectors)

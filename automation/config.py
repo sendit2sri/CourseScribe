@@ -1,9 +1,18 @@
-"""Configuration dataclass and validation for the automation tool."""
+"""Configuration dataclass and validation for the automation tool.
+
+Settings are resolved in priority order:
+  1. Explicit CLI arguments (highest priority)
+  2. Environment variables / .env file
+  3. Dataclass defaults (lowest priority)
+"""
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
+
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +28,12 @@ DEFAULT_MUTATION_QUIET_MS = 500
 LOW_QUALITY_CHAR_THRESHOLD = 50
 
 
+def load_env_config() -> None:
+    """Load .env file. Searches cwd then project root."""
+    # Try .env in current dir first, then parent dirs
+    load_dotenv(override=False)
+
+
 @dataclass
 class AutomationConfig:
     """All settings for a CourseScribe automation run."""
@@ -29,10 +44,15 @@ class AutomationConfig:
     viewport_width: int = DEFAULT_VIEWPORT_WIDTH
     viewport_height: int = DEFAULT_VIEWPORT_HEIGHT
 
-    # Course
+    # Course URLs
     start_url: str = ""
+    login_url: str = ""
     start_module: int = 1
     start_lesson: int = 1
+
+    # Credentials (loaded from .env, never from CLI args)
+    login_username: str = ""
+    login_password: str = ""
 
     # Capture
     capture_mode: str = "full"  # "full" | "viewport" | "section"
@@ -68,12 +88,59 @@ class AutomationConfig:
     log_level: str = "INFO"
     log_file: Optional[Path] = None
 
+    def load_from_env(self) -> None:
+        """Load settings from environment variables.
+
+        Called after construction but before CLI overrides, so CLI wins.
+        Credentials are ONLY loaded from env (never from CLI args).
+        """
+        load_env_config()
+
+        # Credentials — only from .env, never CLI
+        self.login_username = os.getenv("COURSESCRIBE_USERNAME", self.login_username)
+        self.login_password = os.getenv("COURSESCRIBE_PASSWORD", self.login_password)
+
+        # URLs — .env provides defaults, CLI can override
+        if not self.login_url:
+            self.login_url = os.getenv("COURSESCRIBE_LOGIN_URL", "")
+        if not self.start_url:
+            self.start_url = os.getenv("COURSESCRIBE_START_URL", "")
+
+        # Browser profile — .env default, CLI can override
+        env_profile = os.getenv("COURSESCRIBE_BROWSER_PROFILE", "")
+        if env_profile and self.browser_data_dir == DEFAULT_BROWSER_DATA_DIR:
+            self.browser_data_dir = Path(env_profile).expanduser()
+
+    @property
+    def has_credentials(self) -> bool:
+        """True if login credentials are available from .env."""
+        return bool(self.login_username and self.login_password)
+
+    @property
+    def effective_login_url(self) -> str:
+        """The URL to use for login: login_url if set, else start_url."""
+        return self.login_url or self.start_url
+
+    def masked_username(self) -> str:
+        """Return partially masked username for safe logging."""
+        u = self.login_username
+        if not u:
+            return "(none)"
+        if len(u) <= 4:
+            return u[0] + "***"
+        return u[:2] + "***" + u[-2:]
+
     def validate(self) -> List[str]:
         """Return a list of validation error messages. Empty list means valid."""
         errors: List[str] = []
 
         if not self.login_mode and not self.ocr_only and not self.start_url:
             errors.append("--start-url is required (unless using --login or --ocr-only)")
+
+        if self.login_mode and not self.effective_login_url:
+            errors.append(
+                "--start-url or COURSESCRIBE_LOGIN_URL required for login command"
+            )
 
         if self.capture_mode not in ("full", "viewport", "section"):
             errors.append(f"Invalid capture mode: {self.capture_mode}. Must be full, viewport, or section")
