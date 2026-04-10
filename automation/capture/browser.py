@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Common selectors for login form elements (tried in order)
 _USERNAME_SELECTORS = [
+    "input[name='UserName']",
+    "input[id='userid']",
     "input[name='username']",
     "input[name='email']",
     "input[name='login']",
@@ -180,8 +182,14 @@ class BrowserSession:
         masked = self.config.masked_username()
         logger.info("Attempting auto-login as %s...", masked)
 
-        # Find username field
-        username_el = await self._find_first_visible(self._page, _USERNAME_SELECTORS)
+        # Wait for login form to render (JS-heavy pages like CSOD need extra time)
+        username_el = None
+        for attempt in range(5):
+            username_el = await self._find_first_visible(self._page, _USERNAME_SELECTORS)
+            if username_el:
+                break
+            await asyncio.sleep(1)
+
         if not username_el:
             logger.warning("Username field not found — cannot auto-login")
             return False
