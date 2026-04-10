@@ -23,6 +23,7 @@ class TargetsConfig:
 
     pathway_name: str
     pending_courses: List[str]
+    category: str = ""
     skip_titles: List[str] = field(default_factory=lambda: ["Course Document"])
 
 
@@ -225,15 +226,28 @@ class AutomationConfig:
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in {targets_path}: {e}") from e
 
-        pathway_name = data.get("pathway_name", "")
+        # Support both flat format and nested "targets" array format
+        if "targets" in data and isinstance(data["targets"], list) and data["targets"]:
+            entry = data["targets"][0]
+            category = entry.get("category", "")
+            pathway_name = entry.get("pathway_name", "")
+            raw_courses = entry.get("pending_courses", [])
+            # Handle course objects with "name" key or plain strings
+            pending_courses = [
+                c["name"] if isinstance(c, dict) else c for c in raw_courses
+            ]
+            skip_titles = entry.get("skip_titles", ["Course Document"])
+        else:
+            category = data.get("category", "")
+            pathway_name = data.get("pathway_name", "")
+            pending_courses = data.get("pending_courses", [])
+            skip_titles = data.get("skip_titles", ["Course Document"])
+
         if not pathway_name:
             raise ValueError(f"Missing 'pathway_name' in {targets_path}")
 
-        pending_courses = data.get("pending_courses", [])
         if not pending_courses:
             raise ValueError(f"Missing or empty 'pending_courses' in {targets_path}")
-
-        skip_titles = data.get("skip_titles", ["Course Document"])
 
         logger.info(
             "Loaded targets: pathway=%s, courses=%d, skip_titles=%s",
@@ -244,6 +258,7 @@ class AutomationConfig:
         return TargetsConfig(
             pathway_name=pathway_name,
             pending_courses=pending_courses,
+            category=category,
             skip_titles=skip_titles,
         )
 

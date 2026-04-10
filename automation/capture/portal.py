@@ -121,42 +121,78 @@ class PortalNavigator:
             logger.info("Clicked Pathways box (same page)")
 
     # ------------------------------------------------------------------
-    # Step 2: Select Pathway tab
+    # Step 2a: Select category tab (e.g. "Transact - Core Banking")
     # ------------------------------------------------------------------
 
-    async def select_pathway(self, pathway_name: str) -> None:
-        """Find and click the pathway tab matching the given name.
-
-        Sets self._pathway_container to scope subsequent operations.
-        """
+    async def select_category_tab(self, category: str) -> None:
+        """Click the category tab in the scslider (e.g. 'Transact - Core Banking')."""
         page = self.session.page
-        logger.info("Looking for pathway tab: %s", pathway_name)
+        logger.info("Looking for category tab: %s", category)
 
         for attempt in range(10):
-            # Strategy 1: Search elements matching the tab prefix selectors
             for selector in self.selectors.get_chain("pathway_tab_prefix"):
                 elements = page.locator(selector)
                 count = await elements.count()
                 for i in range(count):
                     el = elements.nth(i)
-                    # Check title attribute
                     title = await el.get_attribute("title") or ""
                     text = await el.inner_text()
                     if (
-                        pathway_name.lower() in title.lower()
-                        or pathway_name.lower() in text.lower()
+                        category.lower() in title.lower()
+                        or category.lower() in text.lower()
                     ):
                         await el.click()
                         await self.session.wait_for_stable_page()
-                        logger.info("Selected pathway tab: %s", pathway_name)
+                        logger.info("Selected category tab: %s", category)
+                        return
+
+            logger.debug("Category tab not yet visible (attempt %d/10)", attempt + 1)
+            await asyncio.sleep(1)
+
+        raise NavigationError(f"Category tab not found: {category}")
+
+    # ------------------------------------------------------------------
+    # Step 2b: Select Pathway dropdown (e.g. "...Wealth Management Practitioner")
+    # ------------------------------------------------------------------
+
+    async def select_pathway(self, pathway_name: str) -> None:
+        """Find and click the pathway dropdown matching the given name.
+
+        On CSOD, pathways are listed as expandable rows under the category tab.
+        Clicking the pathway row expands the course table beneath it.
+        Sets self._pathway_container to scope subsequent operations.
+        """
+        page = self.session.page
+        logger.info("Looking for pathway: %s", pathway_name)
+
+        for attempt in range(10):
+            # Strategy 1: look for pathway labels/links with matching text
+            # CSOD uses [id^='pathway-'] elements or text within the pathway list
+            pathway_labels = page.locator(
+                "[id^='pathway-'], .pathway-name, .pathway-title, "
+                "[class*='pathway'] a, [class*='pathway'] span"
+            )
+            count = await pathway_labels.count()
+            for i in range(count):
+                el = pathway_labels.nth(i)
+                text = await el.inner_text()
+                title = await el.get_attribute("title") or ""
+                if (
+                    pathway_name.lower() in text.lower()
+                    or pathway_name.lower() in title.lower()
+                ):
+                    if await el.is_visible():
+                        await el.click()
+                        await self.session.wait_for_stable_page()
+                        logger.info("Selected pathway: %s", pathway_name)
                         self._pathway_container = self._find_pathway_container(page)
                         return
 
-            # Strategy 2: broad text match
-            tab = page.get_by_text(pathway_name, exact=False)
-            count = await tab.count()
-            for i in range(count):
-                el = tab.nth(i)
+            # Strategy 2: broad visible text match
+            matches = page.get_by_text(pathway_name, exact=False)
+            match_count = await matches.count()
+            for i in range(match_count):
+                el = matches.nth(i)
                 if await el.is_visible():
                     await el.click()
                     await self.session.wait_for_stable_page()
@@ -164,29 +200,10 @@ class PortalNavigator:
                     self._pathway_container = self._find_pathway_container(page)
                     return
 
-            logger.debug("Pathway tab not yet visible (attempt %d/10)", attempt + 1)
+            logger.debug("Pathway not yet visible (attempt %d/10)", attempt + 1)
             await asyncio.sleep(1)
 
-        # Debug: dump page info to help diagnose selector mismatch
-        current_url = page.url
-        logger.warning("Pathway tab not found after 10 attempts. URL: %s", current_url)
-        try:
-            # Log all visible text containing the pathway name keywords
-            keyword = pathway_name.split("-")[0].strip().lower()
-            matches = page.get_by_text(keyword, exact=False)
-            match_count = await matches.count()
-            logger.warning("Found %d elements containing '%s':", match_count, keyword)
-            for i in range(min(match_count, 10)):
-                el = matches.nth(i)
-                tag = await el.evaluate("e => e.tagName")
-                text = (await el.inner_text())[:100]
-                visible = await el.is_visible()
-                outer = (await el.evaluate("e => e.outerHTML"))[:200]
-                logger.warning("  [%d] <%s> visible=%s text='%s' html='%s'", i, tag, visible, text, outer)
-        except Exception as e:
-            logger.warning("Debug dump failed: %s", e)
-
-        raise NavigationError(f"Pathway tab not found: {pathway_name}")
+        raise NavigationError(f"Pathway not found: {pathway_name}")
 
     def _find_pathway_container(self, page: Page) -> Optional[Locator]:
         """Try to identify the container element for the selected pathway.

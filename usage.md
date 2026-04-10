@@ -16,3 +16,12 @@ python -m automation run-all --targets-file targets.json
 
 # 6. Check status
 python -m automation status --output-dir course_capture/TR2PRDXA
+
+
+python extract_courses.py catalog.html --pretty --output courses.json
+
+python extract_courses.py catalog.html --category "Core Banking" --pathway "Accredited" --make-targets --pretty -o targets.json
+
+python -m automation login
+
+python -m automation run-all --targets-file targets.json
