@@ -84,22 +84,27 @@ class PortalNavigator:
         page = self.session.page
         logger.info("Looking for Pathways box...")
 
-        # Try each selector in the chain
-        for selector in self.selectors.get_chain("pathways_box"):
-            locator = page.locator(selector)
-            if await locator.count() > 0:
-                await locator.first.click()
+        # Portal widgets render dynamically — retry for up to ~10 seconds
+        for attempt in range(10):
+            # Try each selector in the chain
+            for selector in self.selectors.get_chain("pathways_box"):
+                locator = page.locator(selector)
+                if await locator.count() > 0:
+                    await locator.first.click()
+                    await self.session.wait_for_stable_page()
+                    logger.info("Clicked Pathways box")
+                    return
+
+            # Fallback: broad text search
+            pathways_text = page.get_by_text("Pathways", exact=True)
+            if await pathways_text.count() > 0:
+                await pathways_text.first.click()
                 await self.session.wait_for_stable_page()
-                logger.info("Clicked Pathways box")
+                logger.info("Clicked Pathways via text match")
                 return
 
-        # Fallback: broad text search
-        pathways_text = page.get_by_text("Pathways", exact=True)
-        if await pathways_text.count() > 0:
-            await pathways_text.first.click()
-            await self.session.wait_for_stable_page()
-            logger.info("Clicked Pathways via text match")
-            return
+            logger.debug("Pathways box not yet visible (attempt %d/10)", attempt + 1)
+            await asyncio.sleep(1)
 
         raise NavigationError("Pathways box not found on the portal page")
 

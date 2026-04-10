@@ -57,7 +57,7 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "course_complete": ".course-complete, .completion-message, .certificate-link",
 
     # ---- Portal / Pathway navigation ----
-    "pathways_box": "#boxTitle4, [id*='boxTitle']:has-text('Pathways')",
+    "pathways_box": "[id*='boxTitle']:has-text('Pathways'), #boxTitle4, [class*='box-title']:has-text('Pathways'), .widget-title:has-text('Pathways')",
     "pathway_tab_prefix": "[id^='tabToolTip'], [id^='tabTitle']",
     "pathway_dropdown_toggle": ".fa.fa-angle-down, .fa.fa-angle-up, [class*='fa-angle']",
     "pathway_course_table": "[id^='pathwayTable-']",
