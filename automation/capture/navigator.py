@@ -10,7 +10,9 @@ import logging
 import re
 from typing import List, Optional, Set, Tuple
 
-from playwright.async_api import Page
+from typing import Union
+
+from playwright.async_api import Frame, Page
 
 from automation.capture.browser import BrowserSession
 from automation.selectors import SelectorProfile
@@ -25,6 +27,7 @@ class CourseNavigator:
     def __init__(self, session: BrowserSession, selectors: SelectorProfile):
         self.session = session
         self.selectors = selectors
+        self._content_frame: Optional[Union[Frame, Page]] = None
         self._visited_urls: Set[str] = set()
         self._page_counter: int = 0  # global page counter for sequential discovery
         self._current_module_index: int = 1
@@ -35,6 +38,17 @@ class CourseNavigator:
         self._consecutive_same_fingerprint: int = 0
         self._LOOP_THRESHOLD: int = 3
 
+    def set_content_frame(self, frame: Optional[Union[Frame, Page]]) -> None:
+        """Set the content frame (iframe) where course content lives."""
+        self._content_frame = frame
+
+    @property
+    def content_page(self) -> Union[Frame, Page]:
+        """Return the content frame if set, otherwise the session page."""
+        if self._content_frame is not None:
+            return self._content_frame
+        return self.session.page
+
     async def discover_structure_sequential(self) -> List[PageInfo]:
         """Discover pages by following Next buttons from current position.
 
@@ -42,7 +56,7 @@ class CourseNavigator:
         platform DOM structure.  Returns all discovered PageInfo objects.
         """
         pages: List[PageInfo] = []
-        page = self.session.page
+        page = self.content_page
 
         while True:
             await self.session.wait_for_stable_page()
@@ -76,12 +90,16 @@ class CourseNavigator:
 
     async def get_current_page_info(self) -> PageInfo:
         """Extract page metadata from the currently loaded DOM."""
-        page = self.session.page
+        page = self.content_page
         url = page.url
 
         page_title = await self._extract_text(page, self.selectors.get("page_title"))
         if not page_title:
-            page_title = await page.title() or f"Page {self._page_counter}"
+            try:
+                page_title = await page.title() or f"Page {self._page_counter}"
+            except AttributeError:
+                # Frame objects don't have .title()
+                page_title = f"Page {self._page_counter}"
 
         # Try to extract module/lesson names from DOM
         module_name = await self._extract_module_name(page)
@@ -131,7 +149,7 @@ class CourseNavigator:
 
         Returns None if no Next button or at end of course.
         """
-        page = self.session.page
+        page = self.content_page
         next_sel = self.selectors.get("next_button")
 
         for selector in self.selectors.get_chain("next_button"):
@@ -195,7 +213,7 @@ class CourseNavigator:
 
     async def has_next(self) -> bool:
         """Check if a Next button exists and is enabled."""
-        page = self.session.page
+        page = self.content_page
         for selector in self.selectors.get_chain("next_button"):
             try:
                 button = await page.query_selector(selector)
@@ -213,7 +231,7 @@ class CourseNavigator:
 
         Returns the number of elements expanded.
         """
-        page = self.session.page
+        page = self.content_page
         expanded = 0
 
         # Expand closed accordions
@@ -253,7 +271,7 @@ class CourseNavigator:
         """Detect if we've moved to a new module (for index tracking)."""
         if prev_info is None:
             return False
-        current_module = await self._extract_module_name(self.session.page)
+        current_module = await self._extract_module_name(self.content_page)
         if current_module and current_module != prev_info.module_name:
             self._current_module_index += 1
             self._current_lesson_index = 1
@@ -265,7 +283,7 @@ class CourseNavigator:
         """Detect if we've moved to a new lesson."""
         if prev_info is None:
             return False
-        current_lesson = await self._extract_lesson_name(self.session.page)
+        current_lesson = await self._extract_lesson_name(self.content_page)
         if current_lesson and current_lesson != prev_info.lesson_name:
             self._current_lesson_index += 1
             self._current_page_index = 0
@@ -307,7 +325,7 @@ class CourseNavigator:
         if not skip_titles:
             return False
 
-        page = self.session.page
+        page = self.content_page
         sources: List[str] = []
 
         # Source 1: page_title selector
@@ -409,7 +427,7 @@ class CourseNavigator:
 
     async def _try_sidebar_navigation(self, page_info: PageInfo) -> bool:
         """Try to navigate by clicking a matching lesson in the sidebar."""
-        page = self.session.page
+        page = self.content_page
         lesson_chain = self.selectors.get("lesson_item")
         if not lesson_chain:
             return False
@@ -437,7 +455,7 @@ class CourseNavigator:
 
     async def extract_dom_text(self) -> str:
         """Extract visible text from the main content area for fingerprinting."""
-        page = self.session.page
+        page = self.content_page
         for selector in self.selectors.get_chain("main_content"):
             try:
                 el = await page.query_selector(selector)

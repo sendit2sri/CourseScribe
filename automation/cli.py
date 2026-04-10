@@ -540,6 +540,8 @@ async def _run_single_course(
 
     navigator = CourseNavigator(session, selectors)
     navigator.reset()
+    if content_frame is not None:
+        navigator.set_content_frame(content_frame)
     capturer = ScreenshotCapture(session, config, selectors)
     processor = PageProcessor(config) if process_pages else None
     classifier = ContentClassifier(selectors) if process_pages else None

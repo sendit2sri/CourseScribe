@@ -90,23 +90,35 @@ class PortalNavigator:
             for selector in self.selectors.get_chain("pathways_box"):
                 locator = page.locator(selector)
                 if await locator.count() > 0:
-                    await locator.first.click()
-                    await self.session.wait_for_stable_page()
-                    logger.info("Clicked Pathways box")
+                    await self._click_pathways_link(locator.first)
                     return
 
-            # Fallback: broad text search
-            pathways_text = page.get_by_text("Pathways", exact=True)
-            if await pathways_text.count() > 0:
-                await pathways_text.first.click()
-                await self.session.wait_for_stable_page()
-                logger.info("Clicked Pathways via text match")
-                return
+            # Fallback: find all "Pathways" text matches, click first visible one
+            pathways_all = page.get_by_text("Pathways", exact=True)
+            count = await pathways_all.count()
+            for i in range(count):
+                el = pathways_all.nth(i)
+                if await el.is_visible():
+                    await self._click_pathways_link(el)
+                    return
 
             logger.debug("Pathways box not yet visible (attempt %d/10)", attempt + 1)
             await asyncio.sleep(1)
 
         raise NavigationError("Pathways box not found on the portal page")
+
+    async def _click_pathways_link(self, locator: Locator) -> None:
+        """Click the Pathways element, handling new-tab or same-page navigation."""
+        page_count_before = len(self.session._context.pages)
+        try:
+            new_page = await self.session.click_and_wait_for_new_tab(
+                locator.click, timeout_ms=5000
+            )
+            logger.info("Pathways opened in new tab: %s", new_page.url)
+        except Exception:
+            # Didn't open a new tab — stayed on same page
+            await self.session.wait_for_stable_page()
+            logger.info("Clicked Pathways box (same page)")
 
     # ------------------------------------------------------------------
     # Step 2: Select Pathway tab
@@ -120,34 +132,59 @@ class PortalNavigator:
         page = self.session.page
         logger.info("Looking for pathway tab: %s", pathway_name)
 
-        # Strategy 1: Search elements matching the tab prefix selectors
-        for selector in self.selectors.get_chain("pathway_tab_prefix"):
-            elements = page.locator(selector)
-            count = await elements.count()
+        for attempt in range(10):
+            # Strategy 1: Search elements matching the tab prefix selectors
+            for selector in self.selectors.get_chain("pathway_tab_prefix"):
+                elements = page.locator(selector)
+                count = await elements.count()
+                for i in range(count):
+                    el = elements.nth(i)
+                    # Check title attribute
+                    title = await el.get_attribute("title") or ""
+                    text = await el.inner_text()
+                    if (
+                        pathway_name.lower() in title.lower()
+                        or pathway_name.lower() in text.lower()
+                    ):
+                        await el.click()
+                        await self.session.wait_for_stable_page()
+                        logger.info("Selected pathway tab: %s", pathway_name)
+                        self._pathway_container = self._find_pathway_container(page)
+                        return
+
+            # Strategy 2: broad text match
+            tab = page.get_by_text(pathway_name, exact=False)
+            count = await tab.count()
             for i in range(count):
-                el = elements.nth(i)
-                # Check title attribute
-                title = await el.get_attribute("title") or ""
-                text = await el.inner_text()
-                if (
-                    pathway_name.lower() in title.lower()
-                    or pathway_name.lower() in text.lower()
-                ):
+                el = tab.nth(i)
+                if await el.is_visible():
                     await el.click()
                     await self.session.wait_for_stable_page()
-                    logger.info("Selected pathway tab: %s", pathway_name)
-                    # Try to identify the pathway container for scoped operations
+                    logger.info("Selected pathway via text match: %s", pathway_name)
                     self._pathway_container = self._find_pathway_container(page)
                     return
 
-        # Strategy 2: broad text match
-        tab = page.get_by_text(pathway_name, exact=False)
-        if await tab.count() > 0:
-            await tab.first.click()
-            await self.session.wait_for_stable_page()
-            logger.info("Selected pathway via text match: %s", pathway_name)
-            self._pathway_container = self._find_pathway_container(page)
-            return
+            logger.debug("Pathway tab not yet visible (attempt %d/10)", attempt + 1)
+            await asyncio.sleep(1)
+
+        # Debug: dump page info to help diagnose selector mismatch
+        current_url = page.url
+        logger.warning("Pathway tab not found after 10 attempts. URL: %s", current_url)
+        try:
+            # Log all visible text containing the pathway name keywords
+            keyword = pathway_name.split("-")[0].strip().lower()
+            matches = page.get_by_text(keyword, exact=False)
+            match_count = await matches.count()
+            logger.warning("Found %d elements containing '%s':", match_count, keyword)
+            for i in range(min(match_count, 10)):
+                el = matches.nth(i)
+                tag = await el.evaluate("e => e.tagName")
+                text = (await el.inner_text())[:100]
+                visible = await el.is_visible()
+                outer = (await el.evaluate("e => e.outerHTML"))[:200]
+                logger.warning("  [%d] <%s> visible=%s text='%s' html='%s'", i, tag, visible, text, outer)
+        except Exception as e:
+            logger.warning("Debug dump failed: %s", e)
 
         raise NavigationError(f"Pathway tab not found: {pathway_name}")
 
