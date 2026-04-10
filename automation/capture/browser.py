@@ -57,6 +57,28 @@ _SUBMIT_SELECTORS = [
     "button:has-text('Submit')",
 ]
 
+# URL substrings that indicate a login/SSO/authentication page
+_LOGIN_URL_PATTERNS = (
+    "/login", "/signin", "/sign-in", "/sso", "/saml",
+    "/auth", "/oauth", "/idp", "/adfs",
+    "login.microsoftonline.com",
+    "accounts.google.com",
+)
+
+# Generic indicators that the user is logged in
+_LOGGED_IN_INDICATORS = (
+    ".user-menu", ".profile-icon", ".logged-in",
+    ".user-avatar", ".account-menu",
+)
+
+# Platform-specific indicators that the portal is ready (post-login)
+_PORTAL_READY_INDICATORS = (
+    "#boxTitle4",
+    "[id*='boxTitle']",
+    ".catalog-home",
+    "[id*='pathway']",
+)
+
 
 class BrowserSession:
     """Manages a persistent Playwright Chromium browser context."""
@@ -104,9 +126,16 @@ class BrowserSession:
     async def is_session_valid(self) -> bool:
         """Check if the current browser session is still authenticated.
 
-        Navigates to start_url and checks whether we land on a login page
-        (detected by the presence of a password input field).
-        Returns True if session appears valid (no login form visible).
+        Uses multiple signals to avoid false positives:
+          1. Navigate and wait for page to stabilise (SSO redirects, JS)
+          2. Check final URL for login-related patterns
+          3. Check for username OR password fields (covers multi-step login)
+          4. Check for positive logged-in / portal-ready indicators
+
+        Decision rule (conservative):
+          - Any login evidence → False
+          - Positive authenticated evidence → True
+          - Ambiguous / no evidence → False
         """
         if not self._page:
             return False
@@ -114,24 +143,60 @@ class BrowserSession:
         url = self.config.start_url or self.config.login_url
         if not url:
             logger.debug("No URL to validate session against")
-            return True  # assume valid if we can't check
+            return True  # can't check — assume valid
 
+        # Navigate with domcontentloaded, then try networkidle for redirects
         try:
             await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1)  # brief settle
-
-            # If a password field is visible, we're on a login page
-            for sel in _PASSWORD_SELECTORS:
-                el = await self._page.query_selector(sel)
-                if el and await el.is_visible():
-                    logger.info("Session expired — login page detected")
-                    return False
-
-            logger.info("Session valid — no login page detected")
-            return True
         except Exception as e:
-            logger.warning("Session validation error: %s", e)
+            logger.warning("Session validation navigation error: %s", e)
             return False
+
+        # Try networkidle to let SSO redirects complete (graceful — don't fail if it times out)
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            logger.debug("networkidle timeout during session check — continuing with signal detection")
+
+        # Extra settle time for late-rendering JS login widgets
+        await asyncio.sleep(3)
+
+        # Collect all auth signals from the current page state
+        signals = await self._collect_auth_signals()
+        has_login_evidence = (
+            signals["login_url_pattern"]
+            or signals["username_field_visible"]
+            or signals["password_field_visible"]
+        )
+        has_auth_evidence = (
+            signals["logged_in_indicator"]
+            or signals["portal_ready_indicator"]
+        )
+
+        if has_login_evidence:
+            logger.info(
+                "Session expired — login evidence detected (url_pattern=%s, username=%s, password=%s)",
+                signals["login_url_pattern"],
+                signals["username_field_visible"],
+                signals["password_field_visible"],
+            )
+            return False
+
+        if has_auth_evidence:
+            logger.info(
+                "Session valid — authenticated evidence found (logged_in=%s, portal_ready=%s)",
+                signals["logged_in_indicator"],
+                signals["portal_ready_indicator"],
+            )
+            return True
+
+        # Ambiguous: no login signals, but no positive confirmation either
+        logger.info(
+            "Session status ambiguous — no login form or authenticated indicators found. "
+            "Assuming expired (conservative). URL: %s",
+            signals["url"],
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Login flows
@@ -273,7 +338,8 @@ class BrowserSession:
         """Verify session is valid; re-login if not.
 
         Called at the start of capture/run commands to handle expired sessions
-        transparently.
+        transparently. Includes post-verification to catch cases where login
+        appeared to succeed but the page is still a login form.
         """
         if await self.is_session_valid():
             logger.info("Existing session is valid")
@@ -289,9 +355,50 @@ class BrowserSession:
         # Try auto-login first, then manual fallback
         if self.config.has_credentials:
             if await self._try_auto_login():
-                return
+                # Post-check: verify we actually left the login page
+                if not await self._is_still_on_login_page():
+                    return
+                logger.warning(
+                    "Auto-login reported success but still on login page — "
+                    "falling through to manual login"
+                )
 
         await self._manual_login_prompt()
+
+        # Final post-check after manual login
+        if await self._is_still_on_login_page():
+            logger.error(
+                "Still on login page after manual login. Current URL: %s",
+                self._page.url,
+            )
+            raise RuntimeError(
+                "Authentication failed — still on login page after manual login. "
+                "Please check credentials and try again."
+            )
+
+    async def _is_still_on_login_page(self) -> bool:
+        """Quick check: are we still on a login page?
+
+        Lightweight — does NOT navigate, just inspects the current page.
+        Reuses _collect_auth_signals() for consistent detection.
+        """
+        if not self._page:
+            return True
+
+        signals = await self._collect_auth_signals()
+        still_on_login = (
+            signals["login_url_pattern"]
+            or signals["username_field_visible"]
+            or signals["password_field_visible"]
+        )
+        if still_on_login:
+            logger.debug(
+                "Post-login check: still on login page (url_pattern=%s, username=%s, password=%s)",
+                signals["login_url_pattern"],
+                signals["username_field_visible"],
+                signals["password_field_visible"],
+            )
+        return still_on_login
 
     # ------------------------------------------------------------------
     # Helper: find first visible element from a list of selectors
@@ -308,6 +415,81 @@ class BrowserSession:
             except Exception:
                 continue
         return None
+
+    # ------------------------------------------------------------------
+    # Centralized auth signal collection
+    # ------------------------------------------------------------------
+
+    async def _collect_auth_signals(self) -> dict:
+        """Collect all authentication-related signals from the current page.
+
+        Does NOT navigate — inspects current page state only.
+        Returns a dict of booleans for each signal type.
+        """
+        signals = {
+            "url": self._page.url if self._page else "",
+            "login_url_pattern": False,
+            "username_field_visible": False,
+            "password_field_visible": False,
+            "logged_in_indicator": False,
+            "portal_ready_indicator": False,
+        }
+        if not self._page:
+            return signals
+
+        # Check URL for login patterns
+        current_url = (self._page.url or "").lower()
+        for pattern in _LOGIN_URL_PATTERNS:
+            if pattern.lower() in current_url:
+                signals["login_url_pattern"] = True
+                logger.debug("Auth signal: URL matched login pattern '%s'", pattern)
+                break
+
+        # Check for visible username fields (multi-step login detection)
+        for sel in _USERNAME_SELECTORS:
+            try:
+                el = await self._page.query_selector(sel)
+                if el and await el.is_visible():
+                    signals["username_field_visible"] = True
+                    logger.debug("Auth signal: username field visible (%s)", sel)
+                    break
+            except Exception:
+                continue
+
+        # Check for visible password fields
+        for sel in _PASSWORD_SELECTORS:
+            try:
+                el = await self._page.query_selector(sel)
+                if el and await el.is_visible():
+                    signals["password_field_visible"] = True
+                    logger.debug("Auth signal: password field visible (%s)", sel)
+                    break
+            except Exception:
+                continue
+
+        # Check for generic logged-in indicators
+        for sel in _LOGGED_IN_INDICATORS:
+            try:
+                el = await self._page.query_selector(sel)
+                if el and await el.is_visible():
+                    signals["logged_in_indicator"] = True
+                    logger.debug("Auth signal: logged-in indicator found (%s)", sel)
+                    break
+            except Exception:
+                continue
+
+        # Check for portal-ready indicators (platform-specific)
+        for sel in _PORTAL_READY_INDICATORS:
+            try:
+                el = await self._page.query_selector(sel)
+                if el and await el.is_visible():
+                    signals["portal_ready_indicator"] = True
+                    logger.debug("Auth signal: portal-ready indicator found (%s)", sel)
+                    break
+            except Exception:
+                continue
+
+        return signals
 
     # ------------------------------------------------------------------
     # Multi-tab management
