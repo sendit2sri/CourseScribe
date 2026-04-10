@@ -7,6 +7,13 @@ and outputs a JSON file with all categories, pathways, and courses.
 
 Usage:
     python extract_courses.py <input.html> [--output courses.json] [--pretty]
+
+    # Filter by category, pathway, or course code
+    python extract_courses.py catalog.html --category "Core Banking" --pretty
+    python extract_courses.py catalog.html --course-code TR2PRDXA --pretty
+
+    # Generate targets.json for automation
+    python extract_courses.py catalog.html --category "Core Banking" --make-targets -o targets.json
 """
 
 import argparse
@@ -163,6 +170,9 @@ def extract_courses_from_table(table) -> list[dict]:
         if not name:
             continue
 
+        raw_credits_text = extract_cell_text(cells[3])
+        raw_deps_text = extract_cell_text(cells[4])
+
         courses.append({
             "name": name,
             "code": code,
@@ -171,6 +181,12 @@ def extract_courses_from_table(table) -> list[dict]:
             "credits": credits,
             "dependencies": dependencies,
             "url": url,
+            "raw": {
+                "title_text": raw_name,
+                "exam_text": exam,
+                "credits_text": raw_credits_text,
+                "dependencies_text": raw_deps_text,
+            },
         })
 
     return courses
@@ -244,6 +260,94 @@ def extract_all(html: str) -> dict:
     return {"categories": categories}
 
 
+def filter_results(data: dict, category: str = None, pathway: str = None,
+                   course_code: str = None) -> dict:
+    """Filter extracted data by category, pathway, or course code.
+
+    Matching is case-insensitive substring for category/pathway titles,
+    and exact match for course codes.
+    """
+    categories = data["categories"]
+
+    if category:
+        cat_lower = category.lower()
+        categories = [
+            c for c in categories
+            if cat_lower in c["title"].lower()
+        ]
+
+    if pathway:
+        pw_lower = pathway.lower()
+        filtered = []
+        for cat in categories:
+            matching_pathways = [
+                p for p in cat["pathways"]
+                if pw_lower in p["title"].lower()
+            ]
+            if matching_pathways:
+                filtered.append({**cat, "pathways": matching_pathways})
+        categories = filtered
+
+    if course_code:
+        code_upper = course_code.upper()
+        filtered = []
+        for cat in categories:
+            matching_pathways = []
+            for pw in cat["pathways"]:
+                matching_courses = [
+                    c for c in pw["courses"]
+                    if c["code"].upper() == code_upper
+                ]
+                if matching_courses:
+                    matching_pathways.append({**pw, "courses": matching_courses})
+            if matching_pathways:
+                filtered.append({**cat, "pathways": matching_pathways})
+        categories = filtered
+
+    return {"categories": categories}
+
+
+def generate_targets(data: dict, skip_titles: list[str] = None) -> dict:
+    """Generate a targets.json structure from extracted course data.
+
+    Produces one entry per pathway with pending_courses containing
+    both name and code for each course.
+    """
+    if skip_titles is None:
+        skip_titles = ["Course Document"]
+
+    targets = []
+    for cat in data["categories"]:
+        for pw in cat["pathways"]:
+            pending = []
+            for course in pw["courses"]:
+                # Reconstruct the full name with code (as used in portal)
+                full_name = f"{course['name']} {course['code']}" if course["code"] else course["name"]
+                pending.append({
+                    "name": full_name,
+                    "code": course["code"],
+                })
+            targets.append({
+                "category": cat["title"],
+                "pathway_name": pw["title"],
+                "pending_courses": pending,
+                "skip_titles": skip_titles,
+            })
+
+    return {"targets": targets}
+
+
+def count_totals(data: dict) -> tuple[int, int, int]:
+    """Return (categories, pathways, courses) counts."""
+    total_pathways = sum(len(c["pathways"]) for c in data["categories"])
+    total_courses = sum(
+        len(p["courses"])
+        for c in data["categories"]
+        for p in c["pathways"]
+    )
+    return len(data["categories"]), total_pathways, total_courses
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract Temenos TLC course data from HTML to JSON"
@@ -258,6 +362,29 @@ def main():
         action="store_true",
         help="Pretty-print the JSON output",
     )
+
+    # Filter options
+    filter_group = parser.add_argument_group("filters")
+    filter_group.add_argument(
+        "--category",
+        help="Filter by category title (case-insensitive substring match)",
+    )
+    filter_group.add_argument(
+        "--pathway",
+        help="Filter by pathway title (case-insensitive substring match)",
+    )
+    filter_group.add_argument(
+        "--course-code",
+        help="Filter by exact course code (e.g. TR2PRDXA)",
+    )
+
+    # Targets generation
+    parser.add_argument(
+        "--make-targets",
+        action="store_true",
+        help="Output targets.json format instead of full catalog",
+    )
+
     args = parser.parse_args()
 
     with open(args.input, 'r', encoding='utf-8') as f:
@@ -265,23 +392,31 @@ def main():
 
     result = extract_all(html)
 
+    # Apply filters
+    if args.category or args.pathway or args.course_code:
+        result = filter_results(
+            result,
+            category=args.category,
+            pathway=args.pathway,
+            course_code=args.course_code,
+        )
+
+    # Choose output format
+    if args.make_targets:
+        output = generate_targets(result)
+    else:
+        output = result
+
     indent = 2 if args.pretty else None
-    json_str = json.dumps(result, indent=indent, ensure_ascii=False)
+    json_str = json.dumps(output, indent=indent, ensure_ascii=False)
 
     if args.output:
         with open(args.output, 'w', encoding='utf-8') as f:
             f.write(json_str)
             f.write('\n')
-        # Print summary to stderr
-        total_pathways = sum(len(c["pathways"]) for c in result["categories"])
-        total_courses = sum(
-            len(p["courses"])
-            for c in result["categories"]
-            for p in c["pathways"]
-        )
+        cats, pws, courses = count_totals(result)
         print(
-            f"Extracted {len(result['categories'])} categories, "
-            f"{total_pathways} pathways, {total_courses} courses "
+            f"Extracted {cats} categories, {pws} pathways, {courses} courses "
             f"→ {args.output}",
             file=sys.stderr,
         )
