@@ -9,6 +9,8 @@ Usage:
   python -m automation review  --output-dir DIR
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
@@ -16,8 +18,12 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from automation.config import AutomationConfig
+
+if TYPE_CHECKING:
+    from playwright.async_api import Frame, Page
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +115,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="List pages flagged as needing review",
     )
 
+    # run-all (multi-course pipeline)
+    run_all_parser = subparsers.add_parser(
+        "run-all", parents=[common, browser_args, ai_args, capture_args],
+        help="Multi-course pipeline: iterate through courses in targets.json",
+    )
+    run_all_parser.add_argument(
+        "--targets-file", type=Path, default=Path("targets.json"),
+        help="Path to targets.json file (default: ./targets.json)",
+    )
+
     return parser
 
 
@@ -166,6 +182,11 @@ def args_to_config(args: argparse.Namespace) -> AutomationConfig:
     config.login_mode = args.command == "login"
     config.capture_only = args.command == "capture"
     config.ocr_only = args.command == "process"
+    config.multi_course_mode = args.command == "run-all"
+
+    # Multi-course args
+    if hasattr(args, "targets_file") and args.targets_file is not None:
+        config.targets_file = args.targets_file
 
     return config
 
@@ -324,7 +345,350 @@ def cmd_review(config: AutomationConfig) -> None:
 
 
 # =====================================================================
-# Core capture loop
+# Multi-course commands
+# =====================================================================
+
+
+async def cmd_run_all(config: AutomationConfig) -> None:
+    """Handle the 'run-all' command — multi-course pipeline."""
+    await _run_multi_course_loop(config, process_pages=True)
+
+
+async def _run_multi_course_loop(
+    config: AutomationConfig, process_pages: bool
+) -> None:
+    """Main orchestration loop for processing multiple courses from targets.json."""
+    from automation.capture.browser import BrowserSession
+    from automation.capture.navigator import CourseNavigator
+    from automation.capture.portal import CourseLaunchError, NavigationError, PortalNavigator
+    from automation.capture.screenshot import ScreenshotCapture
+    from automation.pipeline.classifier import ContentClassifier
+    from automation.pipeline.processor import PageProcessor
+    from automation.selectors import SelectorProfile
+    from automation.state.courses_state import CoursesStateManager
+    from automation.state.manifest import ManifestManager
+
+    # Load targets
+    targets = config.load_targets(config.targets_file)
+    selectors = _load_selectors(config)
+
+    # Initialize multi-course state
+    courses_state = CoursesStateManager(config.output_dir)
+    courses_state.init_from_targets(targets)
+    courses_state.save()
+
+    session = BrowserSession(config)
+
+    try:
+        await session.start()
+        await session.ensure_authenticated()
+
+        # Navigate to pathway
+        portal = PortalNavigator(session, selectors, targets)
+        await portal.navigate_to_pathways()
+        await portal.select_pathway(targets.pathway_name)
+        await portal.expand_course_section()
+
+        # Save portal page reference for tab management
+        session.save_as_portal_page()
+
+        pending = courses_state.get_pending_courses()
+        print(f"\n{len(pending)} course(s) to process\n")
+
+        for course_name in pending:
+            if _shutdown_requested:
+                logger.info("Shutdown requested, stopping after current course")
+                break
+
+            print(f"\n{'=' * 60}")
+            print(f"Starting: {course_name}")
+            print(f"{'=' * 60}\n")
+
+            course_dir_name = courses_state.course_output_dir(course_name)
+            full_course_dir = config.output_dir / course_dir_name
+            courses_state.mark_in_progress(course_name, course_dir_name)
+            courses_state.save()
+
+            try:
+                # Find and open course link (opens new tab)
+                await portal.open_course_link(course_name)
+
+                # Launch course in the new tab
+                launch_result = await portal.launch_course()
+
+                # Run the per-course capture loop
+                await _run_single_course(
+                    session=session,
+                    config=config,
+                    selectors=selectors,
+                    course_output_dir=full_course_dir,
+                    skip_titles=targets.skip_titles,
+                    process_pages=process_pages,
+                    content_frame=launch_result.content_frame,
+                )
+
+                # Exit course
+                await portal.exit_course()
+
+                # Get page count from manifest
+                manifest = ManifestManager(full_course_dir)
+                total_pages = manifest.total_pages
+
+                # Close course tab, return to portal
+                await session.close_current_page()
+                await session.switch_to_portal_page()
+                await session.wait_for_stable_page()
+
+                courses_state.mark_completed(course_name, total_pages)
+                courses_state.save()
+
+                print(f"\nCompleted: {course_name} ({total_pages} pages)")
+
+                # Re-expand course section (portal may have reloaded)
+                try:
+                    await portal.expand_course_section()
+                except Exception:
+                    logger.debug("Could not re-expand course section (may still be visible)")
+
+            except (NavigationError, CourseLaunchError) as e:
+                logger.error("Course failed: %s: %s", course_name, e)
+                courses_state.mark_failed(course_name, str(e))
+                courses_state.save()
+
+                # Try to recover: close extra tabs, return to portal
+                try:
+                    await session.close_current_page()
+                    await session.switch_to_portal_page()
+                    await session.wait_for_stable_page()
+                    await portal.expand_course_section()
+                except Exception as recover_err:
+                    logger.error("Failed to recover to portal page: %s", recover_err)
+                    break  # Can't continue if we lost the portal
+
+                continue
+
+            except Exception as e:
+                logger.error("Unexpected error for %s: %s", course_name, e)
+                courses_state.mark_failed(course_name, str(e))
+                courses_state.save()
+
+                try:
+                    await session.close_current_page()
+                    await session.switch_to_portal_page()
+                    await session.wait_for_stable_page()
+                except Exception:
+                    logger.error("Failed to recover to portal page")
+                    break
+
+                continue
+
+        # Final summary
+        print("\n" + courses_state.summary_text())
+
+    finally:
+        await session.close()
+
+
+async def _run_single_course(
+    session: "BrowserSession",
+    config: AutomationConfig,
+    selectors: "SelectorProfile",
+    course_output_dir: Path,
+    skip_titles: List[str],
+    process_pages: bool,
+    content_frame: Optional[Union[Frame, Page]] = None,
+) -> None:
+    """Run the capture+process loop for a single course (already on the course page).
+
+    This is the inner loop extracted from _run_capture_loop(), adapted for
+    multi-course orchestration. The caller handles browser start/close and
+    tab management.
+    """
+    from automation.capture.navigator import CourseNavigator
+    from automation.capture.screenshot import ScreenshotCapture
+    from automation.pipeline.classifier import ContentClassifier
+    from automation.pipeline.processor import PageProcessor
+    from automation.state.manifest import ManifestManager
+
+    manifest = ManifestManager(course_output_dir)
+    manifest.set_course_url(await session.get_current_url())
+    manifest.set_config({
+        "capture_mode": config.capture_mode,
+        "ai_provider": config.ai_provider,
+        "model": config.model or "default",
+        "content_type": config.content_type,
+        "enable_crops": config.enable_crops,
+    })
+
+    navigator = CourseNavigator(session, selectors)
+    navigator.reset()
+    capturer = ScreenshotCapture(session, config, selectors)
+    processor = PageProcessor(config) if process_pages else None
+    classifier = ContentClassifier(selectors) if process_pages else None
+
+    # Check for resume
+    resume_pos = manifest.get_resume_position()
+    if resume_pos:
+        logger.info(
+            "Resuming from %s: %s", resume_pos.page_id, resume_pos.page_title
+        )
+        pos = manifest._state.get("current_position", {})
+        navigator.set_position(
+            pos.get("module_index", 1),
+            pos.get("lesson_index", 1),
+            pos.get("page_index", 0),
+        )
+        for pid, state in manifest._page_states.items():
+            if state.url:
+                navigator.mark_url_visited(state.url)
+
+    prev_info = None
+    pages_processed = 0
+
+    while not _shutdown_requested:
+        # Detect module/lesson changes
+        if prev_info:
+            await navigator.detect_module_change(prev_info)
+            await navigator.detect_lesson_change(prev_info)
+
+        # Get current page info
+        page_info = await navigator.get_current_page_info()
+
+        # Skip if already captured (resume scenario)
+        if manifest.is_page_captured(page_info.page_id):
+            logger.info("Skipping already-captured %s", page_info.page_id)
+        else:
+            # Register page
+            manifest.add_page(page_info)
+            manifest.update_position(page_info)
+
+            # Check skip titles
+            if await navigator.is_skip_page(skip_titles):
+                logger.info(
+                    "Skipping page (matched skip title): [%s] %s",
+                    page_info.page_id,
+                    page_info.page_title,
+                )
+                manifest.mark_skipped(
+                    page_info.page_id,
+                    f"matched skip_titles: {page_info.page_title}",
+                )
+            else:
+                # Expand hidden content
+                await navigator.expand_all_content()
+                await session.wait_for_stable_page()
+
+                # Build lesson directory
+                lesson_dir = (
+                    course_output_dir
+                    / page_info.module_dir_name
+                    / page_info.lesson_dir_name
+                )
+
+                # Capture
+                logger.info(
+                    "Capturing [%s] %s", page_info.page_id, page_info.page_title
+                )
+                capture_result = await capturer.capture_page(page_info, lesson_dir)
+
+                # Fingerprint
+                dom_text = await navigator.extract_dom_text()
+                screenshot_hash = ""
+                dom_text_hash = ""
+                if capture_result.full_page_path:
+                    screenshot_hash = manifest.compute_image_hash(
+                        capture_result.full_page_path
+                    )
+                if dom_text:
+                    dom_text_hash = manifest.compute_text_hash(dom_text)
+
+                # Record capture
+                crop_paths = [
+                    str(p.relative_to(course_output_dir))
+                    for p, _ in capture_result.section_crops
+                ]
+                manifest.mark_captured(
+                    page_info.page_id,
+                    screenshot_path=str(
+                        capture_result.full_page_path.relative_to(course_output_dir)
+                    )
+                    if capture_result.full_page_path
+                    else "",
+                    screenshot_hash=screenshot_hash,
+                    dom_text_hash=dom_text_hash,
+                    crops=crop_paths,
+                )
+
+                # Process (if not capture-only)
+                if process_pages and processor and classifier:
+                    result = processor.process_page(
+                        capture_result, lesson_dir, classifier
+                    )
+                    if result.success:
+                        manifest.mark_processed(
+                            page_info.page_id,
+                            raw_text_path=str(
+                                result.raw_text_path.relative_to(course_output_dir)
+                            )
+                            if result.raw_text_path
+                            else "",
+                            cleaned_path=str(
+                                result.cleaned_md_path.relative_to(course_output_dir)
+                            )
+                            if result.cleaned_md_path
+                            else "",
+                            content_type=result.content_type,
+                            ocr_char_count=result.raw_text_length,
+                            low_quality=result.low_quality,
+                            review_reason=result.review_reason,
+                        )
+                        if result.cost_data:
+                            manifest.update_cost(
+                                result.cost_data.get("cost", 0),
+                                result.cost_data.get("requests", 0),
+                                result.cost_data.get("input_tokens", 0),
+                                result.cost_data.get("output_tokens", 0),
+                            )
+                    else:
+                        manifest.mark_failed(
+                            page_info.page_id,
+                            "processing",
+                            result.error or "Unknown error",
+                        )
+
+                pages_processed += 1
+
+        # Save state after every page
+        manifest.save()
+
+        # Delay between pages
+        if config.page_delay > 0:
+            await asyncio.sleep(config.page_delay)
+
+        # Try to navigate to next page
+        prev_info = page_info
+        next_info = await navigator.go_next()
+        if next_info is None:
+            logger.info("Reached end of course")
+            break
+
+    # Final save
+    manifest.save()
+
+    # Print per-course summary
+    print("\n" + manifest.summary_text())
+
+    if process_pages and processor:
+        cost = processor.get_cumulative_cost()
+        if cost:
+            print(
+                f"\nAPI cost: ${cost['total_cost']:.4f} "
+                f"({cost['total_requests']} requests)"
+            )
+
+
+# =====================================================================
+# Core capture loop (single-course, original)
 # =====================================================================
 
 
@@ -558,6 +922,8 @@ def main() -> None:
         asyncio.run(cmd_capture(config))
     elif args.command == "run":
         asyncio.run(cmd_run(config))
+    elif args.command == "run-all":
+        asyncio.run(cmd_run_all(config))
     elif args.command == "process":
         asyncio.run(cmd_process(config))
     elif args.command == "status":

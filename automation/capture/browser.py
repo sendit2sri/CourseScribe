@@ -15,6 +15,7 @@ from typing import Optional
 
 from playwright.async_api import (
     BrowserContext,
+    Frame,
     Page,
     Playwright,
     async_playwright,
@@ -63,6 +64,7 @@ class BrowserSession:
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._portal_page: Optional[Page] = None
 
     async def start(self) -> "BrowserSession":
         """Launch a persistent browser context. Reuses existing profile."""
@@ -298,6 +300,69 @@ class BrowserSession:
             except Exception:
                 continue
         return None
+
+    # ------------------------------------------------------------------
+    # Multi-tab management
+    # ------------------------------------------------------------------
+
+    def save_as_portal_page(self) -> None:
+        """Mark the current page as the portal page (for returning after course tabs)."""
+        self._portal_page = self._page
+        logger.debug("Portal page saved: %s", self._page.url if self._page else "(none)")
+
+    async def click_and_wait_for_new_tab(
+        self, click_action, timeout_ms: int = 30000
+    ) -> Page:
+        """Execute a click action that opens a new tab and switch to it.
+
+        Args:
+            click_action: An async callable that triggers a new tab (e.g., a Locator.click).
+                          Must be awaitable — passed as a coroutine function or lambda.
+            timeout_ms: Max time to wait for the new tab to open.
+
+        Returns:
+            The new Page object (now set as the active page).
+        """
+        if not self._context:
+            raise RuntimeError("Browser not started. Call start() first.")
+
+        async with self._context.expect_page(timeout=timeout_ms) as new_page_info:
+            await click_action()
+
+        new_page = await new_page_info.value
+        await new_page.wait_for_load_state("domcontentloaded")
+        self._page = new_page
+        logger.info("Switched to new tab: %s", new_page.url)
+        return new_page
+
+    async def switch_to_portal_page(self) -> None:
+        """Switch back to the portal tab (saved earlier via save_as_portal_page)."""
+        if self._portal_page and not self._portal_page.is_closed():
+            self._page = self._portal_page
+            await self._page.bring_to_front()
+            logger.debug("Switched back to portal tab")
+        elif self._context and self._context.pages:
+            # Fallback: use the first open page
+            self._page = self._context.pages[0]
+            await self._page.bring_to_front()
+            logger.warning("Portal page lost, fell back to first open tab")
+        else:
+            raise RuntimeError("No pages available to switch to")
+
+    async def close_current_page(self) -> None:
+        """Close the current tab (only if it is not the portal tab)."""
+        if self._page and self._page != self._portal_page:
+            url = self._page.url
+            await self._page.close()
+            logger.info("Closed course tab: %s", url)
+            self._page = None
+
+    @property
+    def context(self) -> BrowserContext:
+        """The underlying Playwright BrowserContext."""
+        if not self._context:
+            raise RuntimeError("Browser not started. Call start() first.")
+        return self._context
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
         """Navigate to a URL and wait for initial load."""
