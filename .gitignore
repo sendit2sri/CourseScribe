@@ -31,7 +31,11 @@ browser_profile/
 # Automation state files (contain URLs, page data)
 run_state.json
 manifest.json
+courses_state.json
 needs_review/
+
+# User-specific target configuration
+targets.json
 
 # OS
 .DS_Store

@@ -6,6 +6,7 @@ Settings are resolved in priority order:
   3. Dataclass defaults (lowest priority)
 """
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -15,6 +16,15 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class TargetsConfig:
+    """Parsed contents of targets.json."""
+
+    pathway_name: str
+    pending_courses: List[str]
+    skip_titles: List[str] = field(default_factory=lambda: ["Course Document"])
+
 
 DEFAULT_BROWSER_DATA_DIR = Path.home() / ".coursescribe" / "browser_profile"
 DEFAULT_OUTPUT_DIR = Path("course_capture")
@@ -76,6 +86,10 @@ class AutomationConfig:
     # Selectors
     selectors_file: Optional[Path] = None
 
+    # Multi-course
+    targets_file: Optional[Path] = None
+    multi_course_mode: bool = False
+
     # Timing
     page_delay: float = DEFAULT_PAGE_DELAY
     stable_wait_ms: int = DEFAULT_STABLE_WAIT_MS
@@ -134,8 +148,9 @@ class AutomationConfig:
         """Return a list of validation error messages. Empty list means valid."""
         errors: List[str] = []
 
-        if not self.login_mode and not self.ocr_only and not self.start_url:
-            errors.append("--start-url is required (unless using --login or --ocr-only)")
+        # start_url is not required in multi-course mode (portal URL comes from login)
+        if not self.login_mode and not self.ocr_only and not self.multi_course_mode and not self.start_url:
+            errors.append("--start-url is required (unless using --login, --ocr-only, or run-all)")
 
         if self.login_mode and not self.effective_login_url:
             errors.append(
@@ -160,6 +175,16 @@ class AutomationConfig:
         if self.selectors_file and not self.selectors_file.exists():
             errors.append(f"Selectors file not found: {self.selectors_file}")
 
+        if self.multi_course_mode:
+            if not self.targets_file:
+                errors.append("--targets-file is required for run-all command")
+            elif not self.targets_file.exists():
+                errors.append(f"Targets file not found: {self.targets_file}")
+            if not self.effective_login_url:
+                errors.append(
+                    "COURSESCRIBE_LOGIN_URL or --login-url required for run-all command"
+                )
+
         return errors
 
     def setup_logging(self) -> None:
@@ -178,9 +203,55 @@ class AutomationConfig:
             force=True,
         )
 
+    def load_targets(self, path: Optional[Path] = None) -> TargetsConfig:
+        """Load and validate targets.json.
+
+        Args:
+            path: Explicit path, or falls back to self.targets_file, then ./targets.json.
+
+        Returns:
+            Parsed TargetsConfig.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            ValueError: If the file is malformed or missing required fields.
+        """
+        targets_path = path or self.targets_file or Path("targets.json")
+        if not targets_path.exists():
+            raise FileNotFoundError(f"Targets file not found: {targets_path}")
+
+        try:
+            data = json.loads(targets_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in {targets_path}: {e}") from e
+
+        pathway_name = data.get("pathway_name", "")
+        if not pathway_name:
+            raise ValueError(f"Missing 'pathway_name' in {targets_path}")
+
+        pending_courses = data.get("pending_courses", [])
+        if not pending_courses:
+            raise ValueError(f"Missing or empty 'pending_courses' in {targets_path}")
+
+        skip_titles = data.get("skip_titles", ["Course Document"])
+
+        logger.info(
+            "Loaded targets: pathway=%s, courses=%d, skip_titles=%s",
+            pathway_name,
+            len(pending_courses),
+            skip_titles,
+        )
+        return TargetsConfig(
+            pathway_name=pathway_name,
+            pending_courses=pending_courses,
+            skip_titles=skip_titles,
+        )
+
     def resolve_paths(self) -> None:
         """Resolve relative paths to absolute."""
         self.output_dir = self.output_dir.resolve()
         self.browser_data_dir = self.browser_data_dir.resolve()
         if self.selectors_file:
             self.selectors_file = self.selectors_file.resolve()
+        if self.targets_file:
+            self.targets_file = self.targets_file.resolve()
