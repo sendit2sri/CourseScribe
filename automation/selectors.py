@@ -26,6 +26,7 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "page_title": "h1, .page-title, .lesson-title, .content-title",
     "main_content": "main, .content, .lesson-content, #content, article, .page-content",
     "next_button": (
+        ".uikit-primary-button_next, "  # Platform-specific (highest priority)
         "button:has-text('Next'), a:has-text('Next'), "
         ".next-btn, [data-action='next'], "
         "button:has-text('Continue'), a:has-text('Continue'), "
@@ -54,6 +55,32 @@ DEFAULT_SELECTORS: Dict[str, str] = {
 
     # Course completion / end detection
     "course_complete": ".course-complete, .completion-message, .certificate-link",
+
+    # ---- Portal / Pathway navigation ----
+    "pathways_box": "#boxTitle4, [id*='boxTitle']:has-text('Pathways')",
+    "pathway_tab_prefix": "[id^='tabToolTip'], [id^='tabTitle']",
+    "pathway_dropdown_toggle": ".fa.fa-angle-down, .fa.fa-angle-up, [class*='fa-angle']",
+    "pathway_course_table": "[id^='pathwayTable-']",
+
+    # ---- Course launch sequence ----
+    "open_curriculum_button": (
+        'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Open Curriculum")'
+    ),
+    "launch_button": (
+        'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Launch")'
+    ),
+    "fullscreen_button": '[data-testid="MinimizeIcon"], [aria-label="View Full Screen Mode"]',
+    "dismiss_resume_no": '.uikit-primary-button:has-text("No")',
+    "exit_course_button": (
+        'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Exit Course")'
+    ),
+
+    # ---- In-course platform-specific ----
+    "chapter_root_title": ".titlesNew h1, .titlesNew",
+    "chapter_item_title": ".titles div, .titles",
+
+    # ---- Content frame detection ----
+    "content_iframe": "iframe[src*='course'], iframe[name*='content'], iframe.course-frame",
 }
 
 

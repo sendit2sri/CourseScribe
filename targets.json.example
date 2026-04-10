@@ -1,0 +1,12 @@
+{
+  "pathway_name": "Transact - Core Banking",
+  "pending_courses": [
+    "Transact Derivatives Administration TR2PRDXA",
+    "Transact Derivatives Trading and Management TR2PRDXT",
+    "Transact Settlements on Derivatives TR2PRSDX",
+    "Transact FO Asset Management TR3PRTAM"
+  ],
+  "skip_titles": [
+    "Course Document"
+  ]
+}

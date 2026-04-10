@@ -24,8 +24,9 @@ STATUS_CLEANED = "cleaned"
 STATUS_FAILED_CAPTURE = "failed_capture"
 STATUS_FAILED_PROCESSING = "failed_processing"
 STATUS_NEEDS_REVIEW = "needs_review"
+STATUS_SKIPPED = "skipped"
 
-TERMINAL_SUCCESS_STATES = {STATUS_CLEANED}
+TERMINAL_SUCCESS_STATES = {STATUS_CLEANED, STATUS_SKIPPED}
 TERMINAL_FAILURE_STATES = {STATUS_FAILED_CAPTURE, STATUS_FAILED_PROCESSING}
 CAPTURABLE_STATES = {STATUS_DISCOVERED, STATUS_FAILED_CAPTURE}
 PROCESSABLE_STATES = {STATUS_CAPTURED, STATUS_CROP_GENERATED, STATUS_FAILED_PROCESSING}
@@ -374,6 +375,18 @@ class ManifestManager:
         state.error = None
         self._sync_state(page_id)
 
+    def mark_skipped(self, page_id: str, reason: str) -> None:
+        """Mark a page as intentionally skipped (e.g., Course Document page).
+
+        The page's url and page_title are already stored from add_page().
+        """
+        state = self._get_or_create_state(page_id)
+        state.status = STATUS_SKIPPED
+        state.review_reason = reason
+        state.captured_at = _now()
+        state.error = None
+        self._sync_state(page_id)
+
     def mark_failed(self, page_id: str, phase: str, error: str) -> None:
         """Record a failure for a page.
 
@@ -547,6 +560,7 @@ class ManifestManager:
         processed = 0
         failed = 0
         needs_review = 0
+        skipped = 0
 
         for state in self._page_states.values():
             if state.status in (
@@ -556,20 +570,24 @@ class ManifestManager:
                 captured += 1
             if state.status in (STATUS_CLEANED, STATUS_NEEDS_REVIEW):
                 processed += 1
+            if state.status == STATUS_SKIPPED:
+                skipped += 1
             if state.status in TERMINAL_FAILURE_STATES:
                 failed += 1
             if state.status == STATUS_NEEDS_REVIEW or state.suspected_low_quality:
                 needs_review += 1
 
+        # Skipped pages count toward "done" for remaining calculation
+        done = processed + skipped + failed
         self._state["progress"] = {
             "total_pages": total,
             "captured": captured,
             "processed": processed,
+            "skipped": skipped,
             "failed": failed,
             "needs_review": needs_review,
-            "remaining": total - processed - failed,
+            "remaining": total - done,
         }
-        self._state["progress"]["total_pages"] = total
 
     def summary_text(self) -> str:
         """Human-readable progress summary."""
@@ -581,6 +599,7 @@ class ManifestManager:
             f"Total pages:   {p.get('total_pages', 0)}",
             f"Captured:      {p.get('captured', 0)}",
             f"Processed:     {p.get('processed', 0)}",
+            f"Skipped:       {p.get('skipped', 0)}",
             f"Failed:        {p.get('failed', 0)}",
             f"Needs review:  {p.get('needs_review', 0)}",
             f"Remaining:     {p.get('remaining', 0)}",

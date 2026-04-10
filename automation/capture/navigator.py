@@ -8,7 +8,7 @@ Navigation fallback strategy (ordered):
 
 import logging
 import re
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from playwright.async_api import Page
 
@@ -30,6 +30,10 @@ class CourseNavigator:
         self._current_module_index: int = 1
         self._current_lesson_index: int = 1
         self._current_page_index: int = 0
+        # Loop protection: track (url, title) fingerprint
+        self._prev_fingerprint: Optional[tuple] = None
+        self._consecutive_same_fingerprint: int = 0
+        self._LOOP_THRESHOLD: int = 3
 
     async def discover_structure_sequential(self) -> List[PageInfo]:
         """Discover pages by following Next buttons from current position.
@@ -162,6 +166,24 @@ class CourseNavigator:
                     self._page_counter += 1
 
                     info = await self.get_current_page_info()
+
+                    # Loop protection: check fingerprint
+                    fingerprint = (new_url, info.page_title)
+                    if fingerprint == self._prev_fingerprint:
+                        self._consecutive_same_fingerprint += 1
+                        if self._consecutive_same_fingerprint >= self._LOOP_THRESHOLD:
+                            logger.warning(
+                                "Loop detected: same page repeated %d times after Next "
+                                "(url=%s, title=%s)",
+                                self._consecutive_same_fingerprint,
+                                new_url,
+                                info.page_title,
+                            )
+                            return None
+                    else:
+                        self._consecutive_same_fingerprint = 0
+                    self._prev_fingerprint = fingerprint
+
                     logger.info(f"Navigated to: [{info.page_id}] {info.page_title}")
                     return info
             except Exception as e:
@@ -259,6 +281,73 @@ class CourseNavigator:
     def mark_url_visited(self, url: str) -> None:
         """Register a URL as already visited (for loop detection on resume)."""
         self._visited_urls.add(url)
+
+    def reset(self) -> None:
+        """Reset navigator state for reuse across courses."""
+        self._visited_urls.clear()
+        self._page_counter = 0
+        self._current_module_index = 1
+        self._current_lesson_index = 1
+        self._current_page_index = 0
+        self._prev_fingerprint = None
+        self._consecutive_same_fingerprint = 0
+
+    async def is_skip_page(self, skip_titles: List[str]) -> bool:
+        """Multi-source skip detection for the current page.
+
+        Checks multiple DOM sources for titles matching skip_titles:
+          1. Page title selector (existing)
+          2. Chapter/item title selector
+          3. Chapter root title selector
+          4. Visible <h1> text
+
+        Returns True if ANY source contains a skip_titles entry
+        (case-insensitive substring match).
+        """
+        if not skip_titles:
+            return False
+
+        page = self.session.page
+        sources: List[str] = []
+
+        # Source 1: page_title selector
+        text = await self._extract_text(page, self.selectors.get("page_title"))
+        if text:
+            sources.append(text)
+
+        # Source 2: chapter_item_title selector
+        text = await self._extract_text(page, self.selectors.get("chapter_item_title"))
+        if text:
+            sources.append(text)
+
+        # Source 3: chapter_root_title selector
+        text = await self._extract_text(page, self.selectors.get("chapter_root_title"))
+        if text:
+            sources.append(text)
+
+        # Source 4: visible <h1> as fallback
+        try:
+            h1 = await page.query_selector("h1")
+            if h1:
+                h1_text = await h1.inner_text()
+                if h1_text and h1_text.strip():
+                    sources.append(h1_text.strip())
+        except Exception:
+            pass
+
+        # Check all sources against all skip titles
+        for source in sources:
+            source_lower = source.lower()
+            for skip in skip_titles:
+                if skip.lower() in source_lower:
+                    logger.info(
+                        "Skip page detected: title '%s' matches skip rule '%s'",
+                        source,
+                        skip,
+                    )
+                    return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Private helpers
