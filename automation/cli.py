@@ -386,6 +386,8 @@ async def _run_multi_course_loop(
         # Navigate to pathway
         portal = PortalNavigator(session, selectors, targets)
         await portal.navigate_to_pathways()
+        if targets.category:
+            await portal.select_category_tab(targets.category)
         await portal.select_pathway(targets.pathway_name)
         await portal.expand_course_section()
 
