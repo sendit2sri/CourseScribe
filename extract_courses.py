@@ -5,7 +5,11 @@ Extract course data from Temenos TLC pathway HTML into structured JSON.
 Parses the scSlider tab/pathway/course hierarchy from the TLC portal HTML
 and outputs a JSON file with all categories, pathways, and courses.
 
+Also supports parsing curriculum sidebar HTML (--curriculum) to extract
+training items, completion status, and progress from individual courses.
+
 Usage:
+    # Catalog mode (default)
     python extract_courses.py <input.html> [--output courses.json] [--pretty]
 
     # Filter by category, pathway, or course code
@@ -14,6 +18,9 @@ Usage:
 
     # Generate targets.json for automation
     python extract_courses.py catalog.html --category "Core Banking" --make-targets -o targets.json
+
+    # Curriculum mode — parse course sidebar HTML
+    python extract_courses.py curriculum.html --curriculum --pretty
 """
 
 import argparse
@@ -260,6 +267,120 @@ def extract_all(html: str) -> dict:
     return {"categories": categories}
 
 
+def extract_curriculum(html: str) -> dict:
+    """Parse curriculum sidebar HTML and extract training items with status.
+
+    The curriculum page has a tree structure with training items at aria-level 2.
+    Each item has a title, completion status, and optional duration.
+
+    Workflow: Open DevTools on curriculum page → copy sidebar outerHTML →
+    save to file → run this parser.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # Extract course title from h1.titleName or top-level tree node
+    course_title = ""
+    title_el = soup.find('h1', class_='titleName')
+    if title_el:
+        course_title = title_el.get_text(strip=True)
+    else:
+        # Fallback: find the level-1 tree item title
+        level1 = soup.find(attrs={"aria-level": "1", "role": "treeitem"})
+        if level1:
+            titles_el = level1.find(class_='titles')
+            if titles_el:
+                course_title = titles_el.get('content', titles_el.get_text(strip=True))
+
+    course_name, course_code = extract_course_code(course_title)
+
+    # Extract overall progress
+    progress_pct = ""
+    pct_el = soup.find(class_='curriculumProgressPercentage')
+    if pct_el:
+        progress_pct = pct_el.get_text(strip=True)
+
+    progress_count = ""
+    count_el = soup.find(attrs={"data-testid": "$rcl-baseElement"})
+    if count_el:
+        progress_count = count_el.get_text(strip=True)
+
+    # Extract overall status
+    overall_status = ""
+    status_el = soup.find(class_='curriculumSummaryStatus')
+    if status_el:
+        overall_status = status_el.get_text(strip=True)
+
+    # Extract total duration
+    total_duration = ""
+    duration_el = soup.find(attrs={"data-testid": "curriculumPlayer$totalDuration_Value"})
+    if duration_el:
+        total_duration = duration_el.get_text(strip=True)
+
+    # Extract training items from tree nodes at aria-level 2
+    items = []
+    tree_items = soup.find_all(attrs={"role": "treeitem", "aria-level": "2"})
+
+    for item in tree_items:
+        node_id = item.get('data-node-id', '')
+        position = item.get('aria-posinset', '')
+        total = item.get('aria-setsize', '')
+
+        # Extract title from .titles element (content attribute is most reliable)
+        title = ""
+        titles_el = item.find(class_='titles')
+        if titles_el:
+            title = titles_el.get('content', '') or titles_el.get('aria-label', '') or titles_el.get_text(strip=True)
+        title = title.strip()
+
+        # Detect completion status from lego-icon
+        status = "not_started"
+        check_icon = item.find('lego-icon', attrs={"data-icon-name": "circle-check"})
+        progress_icon = item.find('lego-icon', attrs={"data-icon-name": "circle-50"})
+        if check_icon:
+            status = "completed"
+        elif progress_icon:
+            status = "in_progress"
+
+        # Extract duration if present
+        duration = ""
+        due_el = item.find(class_='dueDate')
+        if due_el:
+            duration = due_el.get_text(strip=True)
+
+        if not title:
+            continue
+
+        items.append({
+            "position": int(position) if position else 0,
+            "total": int(total) if total else 0,
+            "title": title,
+            "status": status,
+            "duration": duration,
+            "node_id": node_id,
+        })
+
+    # Count statuses
+    completed = sum(1 for i in items if i["status"] == "completed")
+    in_progress = sum(1 for i in items if i["status"] == "in_progress")
+    not_started = sum(1 for i in items if i["status"] == "not_started")
+
+    return {
+        "course_name": course_name,
+        "course_code": course_code,
+        "overall_status": overall_status,
+        "progress": progress_pct,
+        "progress_count": progress_count,
+        "total_duration": total_duration,
+        "summary": {
+            "total_items": len(items),
+            "completed": completed,
+            "in_progress": in_progress,
+            "not_started": not_started,
+        },
+        "items": items,
+    }
+
+
 def filter_results(data: dict, category: str = None, pathway: str = None,
                    course_code: str = None) -> dict:
     """Filter extracted data by category, pathway, or course code.
@@ -385,11 +506,41 @@ def main():
         help="Output targets.json format instead of full catalog",
     )
 
+    # Curriculum mode
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        help="Parse curriculum sidebar HTML instead of catalog HTML",
+    )
+
     args = parser.parse_args()
 
     with open(args.input, 'r', encoding='utf-8') as f:
         html = f.read()
 
+    # Curriculum mode — different parser
+    if args.curriculum:
+        output = extract_curriculum(html)
+        indent = 2 if args.pretty else None
+        json_str = json.dumps(output, indent=indent, ensure_ascii=False)
+
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+                f.write('\n')
+            print(
+                f"Extracted {output['summary']['total_items']} items "
+                f"from \"{output['course_name']}\" "
+                f"({output['summary']['completed']} completed, "
+                f"{output['summary']['in_progress']} in progress) "
+                f"→ {args.output}",
+                file=sys.stderr,
+            )
+        else:
+            print(json_str)
+        return
+
+    # Catalog mode
     result = extract_all(html)
 
     # Apply filters
