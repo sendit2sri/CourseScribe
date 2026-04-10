@@ -416,6 +416,24 @@ async def _run_multi_course_loop(
                 # Launch course in the new tab
                 launch_result = await portal.launch_course()
 
+                # Extract curriculum sidebar before navigating into content
+                try:
+                    curriculum_data = await portal.extract_curriculum_from_page()
+                    if curriculum_data["summary"]["total_items"] > 0:
+                        curriculum_file = full_course_dir / "curriculum.json"
+                        full_course_dir.mkdir(parents=True, exist_ok=True)
+                        import json
+                        with open(curriculum_file, 'w', encoding='utf-8') as f:
+                            json.dump(curriculum_data, f, indent=2, ensure_ascii=False)
+                            f.write('\n')
+                        logger.info(
+                            "Saved curriculum: %d items → %s",
+                            curriculum_data["summary"]["total_items"],
+                            curriculum_file,
+                        )
+                except Exception as e:
+                    logger.warning("Could not extract curriculum sidebar: %s", e)
+
                 # Run the per-course capture loop
                 await _run_single_course(
                     session=session,
