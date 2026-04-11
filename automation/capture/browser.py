@@ -607,6 +607,49 @@ class BrowserSession:
         except Exception:
             logger.debug("DOM stability check timed out — proceeding anyway")
 
+    async def wait_for_content_ready(
+        self,
+        selectors: "SelectorProfile",
+        timeout_ms: int = 30000,
+    ) -> None:
+        """Wait for content to actually render (spinner gone, page counter valid).
+
+        Complements wait_for_stable_page() which only checks network/DOM quiescence.
+        All checks are best-effort — if selectors don't match, we fall through.
+        """
+        if not self._page:
+            return
+
+        # 1. Wait for loading spinner to disappear
+        spinner_sel = selectors.get("loading_spinner")
+        if spinner_sel:
+            try:
+                spinner = self._page.locator(spinner_sel).first
+                if await spinner.is_visible():
+                    logger.debug("Waiting for loading spinner to disappear")
+                    await spinner.wait_for(state="hidden", timeout=timeout_ms)
+            except Exception:
+                pass  # No spinner found or timeout — continue
+
+        # 2. Wait for page indicator to show a real page number (not "- of 10")
+        indicator_sel = selectors.get("page_indicator")
+        if indicator_sel:
+            try:
+                await self._page.locator(indicator_sel).first.wait_for(
+                    state="visible", timeout=5000,
+                )
+                await self._page.wait_for_function(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        return el && /\\d+\\s+(of|\\/)\\s+\\d+/.test(el.textContent);
+                    }""",
+                    indicator_sel,
+                    timeout=timeout_ms,
+                )
+                logger.debug("Page indicator shows valid page number")
+            except Exception:
+                pass  # Indicator not found — fall through
+
     async def get_page_height(self) -> int:
         """Get the full scrollable height of the page."""
         if not self._page:

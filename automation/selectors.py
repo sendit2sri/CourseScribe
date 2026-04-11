@@ -41,6 +41,9 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     # Page position indicator (e.g., "Page 3 of 12")
     "page_indicator": ".page-indicator, .page-count, .pagination-info, .progress-text",
 
+    # Loading spinners / busy indicators
+    "loading_spinner": ".spinner, .loading, [aria-busy='true'], .loader",
+
     # Expandable content
     "accordion_closed": "[aria-expanded='false'], details:not([open]), .collapsed",
     "tab_inactive": "[role='tab']:not([aria-selected='true']), .tab:not(.active)",
