@@ -16,10 +16,13 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Region detection parameters
-MIN_REGION_AREA = 5000  # px^2, skip very small regions
-MIN_WIDTH = 80
-MIN_HEIGHT = 60
-MERGE_DISTANCE = 20  # px, merge regions closer than this
+MIN_REGION_AREA = 15000  # px^2, ~150x100 minimum meaningful region
+MIN_WIDTH = 100
+MIN_HEIGHT = 100
+MERGE_DISTANCE = 60  # px, merge regions closer than this
+MAX_ASPECT_RATIO = 5.0  # reject regions wider than 5:1
+MIN_ASPECT_RATIO = 0.2  # reject regions taller than 1:5
+MIN_DIMENSION_RATIO = 0.08  # region must be >= 8% of image in both dimensions
 
 
 @dataclass
@@ -73,9 +76,9 @@ class ContentCropper:
             cv2.THRESH_BINARY_INV, 11, 2
         )
 
-        # Dilate to connect nearby features
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-        dilated = cv2.dilate(thresh, kernel, iterations=2)
+        # Dilate to connect nearby features (symmetric kernel to avoid horizontal bias)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        dilated = cv2.dilate(thresh, kernel, iterations=3)
 
         # Find contours
         contours, _ = cv2.findContours(
@@ -91,6 +94,15 @@ class ContentCropper:
             if rw * rh < MIN_REGION_AREA or rw < MIN_WIDTH or rh < MIN_HEIGHT:
                 continue
 
+            # Skip extremely elongated regions (thin strips)
+            aspect = rw / max(rh, 1)
+            if aspect > MAX_ASPECT_RATIO or aspect < MIN_ASPECT_RATIO:
+                continue
+
+            # Skip regions too small relative to the image
+            if rw < w * MIN_DIMENSION_RATIO or rh < h * MIN_DIMENSION_RATIO:
+                continue
+
             # Skip regions that span nearly the full image (that's the page itself)
             if rw > w * 0.95 and rh > h * 0.90:
                 continue
@@ -101,6 +113,13 @@ class ContentCropper:
 
         # Merge overlapping regions
         merged = self._merge_nearby(raw_regions)
+
+        # Post-merge: re-apply filters (merging can create oddly shaped bounding boxes)
+        merged = [
+            r for r in merged
+            if r.area >= MIN_REGION_AREA
+            and MIN_ASPECT_RATIO <= r.aspect_ratio <= MAX_ASPECT_RATIO
+        ]
 
         # Sort by Y position (top to bottom)
         merged.sort(key=lambda r: (r.y, r.x))
@@ -156,10 +175,10 @@ class ContentCropper:
     def _classify_by_shape(width: int, height: int) -> str:
         """Heuristic classification based on aspect ratio."""
         ratio = width / max(height, 1)
-        if ratio > 2.5:
-            return "table"  # wide and short → likely a table/grid
-        elif ratio < 0.5:
-            return "text_block"  # tall and narrow → text column
+        if ratio > 3.5:
+            return "table"  # very wide → likely a table/grid
+        elif ratio < 0.3:
+            return "text_block"  # very tall and narrow → text column
         elif 0.8 < ratio < 1.5 and width > 200:
             return "screenshot"  # roughly square, decent size → app screenshot
         else:
