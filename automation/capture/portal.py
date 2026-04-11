@@ -705,20 +705,26 @@ class PortalNavigator:
         await asyncio.sleep(2)
 
         # Handle "Your training is completed" state — click Launch to re-enter
-        await self._wait_and_click(
+        launch_clicked = await self._wait_and_click(
             self.selectors.get("launch_button"),
             "Launch (re-enter completed item)",
-            timeout_ms=10000,
+            timeout_ms=20000,
             optional=True,
         )
 
-        # Click fullscreen
-        result.fullscreen_succeeded = await self._wait_and_click(
-            self.selectors.get("fullscreen_button"),
-            "Fullscreen",
-            timeout_ms=10000,
-            optional=True,
-        )
+        if launch_clicked:
+            # Launch opens the item in full-page mode — wait for it to load
+            await self.session.wait_for_stable_page()
+            await asyncio.sleep(2)
+            result.fullscreen_succeeded = True
+        else:
+            # No Launch button (item not yet completed) — click fullscreen
+            result.fullscreen_succeeded = await self._wait_and_click(
+                self.selectors.get("fullscreen_button"),
+                "Fullscreen",
+                timeout_ms=10000,
+                optional=True,
+            )
 
         # Dismiss resume prompt on outer page (wait longer — popup can be slow)
         resume_dismissed = await self._wait_and_click(
