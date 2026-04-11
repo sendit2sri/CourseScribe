@@ -84,6 +84,12 @@ class PortalNavigator:
         page = self.session.page
         logger.info("Looking for Pathways box...")
 
+        # If we're already on the Pathways page (category tabs visible), skip
+        for selector in self.selectors.get_chain("pathway_tab_prefix"):
+            if await page.locator(selector).count() > 0:
+                logger.info("Already on Pathways page (category tabs detected), skipping navigation")
+                return
+
         # Portal widgets render dynamically — retry for up to ~10 seconds
         for attempt in range(10):
             # Try each selector in the chain
