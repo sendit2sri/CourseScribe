@@ -133,6 +133,13 @@ class ScreenshotCapture:
             try:
                 iframe_el = await page.query_selector(iframe_sel)
                 if iframe_el:
+                    # Scroll iframe content to top before capture
+                    try:
+                        await self._content_frame.evaluate(
+                            "window.scrollTo(0, 0)"
+                        )
+                    except Exception:
+                        pass
                     await iframe_el.screenshot(path=str(output_path))
                     logger.info(f"Content-frame screenshot: {output_path.name}")
                     return output_path
@@ -326,6 +333,9 @@ class ScreenshotCapture:
         candidates = [
             c for idx, c in enumerate(candidates) if idx not in to_remove
         ]
+
+        # Re-sort by vertical position (top to bottom) before screenshotting
+        candidates.sort(key=lambda c: (c[1]["y"], c[1]["x"]))
 
         # --- Phase 3: Screenshot survivors ---
         crop_index = 1
