@@ -333,6 +333,10 @@ class PortalNavigator:
         """
         link = await self.find_course_link(course_name)
 
+        # Scroll into view — course links in pathway tables may be outside viewport
+        await link.scroll_into_view_if_needed()
+        await asyncio.sleep(0.5)
+
         async def _click():
             await link.click()
 
@@ -400,7 +404,7 @@ class PortalNavigator:
             optional=True,
         )
 
-        # Step 4: Dismiss resume prompt (optional, may not appear)
+        # Step 4: Dismiss resume prompt on outer page (optional)
         resume_dismissed = await self._wait_and_click(
             self.selectors.get("dismiss_resume_no"),
             "Dismiss resume prompt (No)",
@@ -415,6 +419,22 @@ class PortalNavigator:
             result.iframe_detected = True
             result.content_frame = content
             logger.info("Course content detected in iframe")
+
+            # Step 5b: Dismiss resume prompt inside iframe (may appear here instead)
+            if not resume_dismissed:
+                try:
+                    dismiss_sel = self.selectors.get("dismiss_resume_no")
+                    if dismiss_sel:
+                        for sel in [s.strip() for s in dismiss_sel.split(",")]:
+                            no_btn = content.locator(sel)
+                            if await no_btn.count() > 0 and await no_btn.first.is_visible():
+                                await no_btn.first.click()
+                                await asyncio.sleep(1)
+                                logger.info("Dismissed resume prompt inside iframe")
+                                result.resume_prompt_appeared = True
+                                break
+                except Exception as e:
+                    logger.debug("iframe resume dismiss check: %s", e)
         else:
             result.content_frame = content
 
@@ -578,6 +598,155 @@ class PortalNavigator:
             "Extracted curriculum: %s (%s) — %d items (%d completed, %d in progress)",
             course_name, course_code, len(items), completed, in_progress,
         )
+        return result
+
+    # ------------------------------------------------------------------
+    # Step 6c: Click a specific curriculum item in the sidebar
+    # ------------------------------------------------------------------
+
+    async def click_curriculum_item(self, position: int, node_id: str = "") -> "LaunchResult":
+        """Click a curriculum item in the sidebar to open its content.
+
+        Finds the tree item by position (1-based) or data-node-id,
+        clicks it, waits for content to load, dismisses any resume
+        popup, and re-detects the content iframe.
+
+        Args:
+            position: 1-based position of the item in the curriculum.
+            node_id: Optional data-node-id attribute for precise targeting.
+
+        Returns:
+            LaunchResult with updated content_frame.
+        """
+        result = LaunchResult()
+        page = self.session.page
+
+        # Try to find the tree item by node_id first, then by position
+        item_locator = None
+        if node_id:
+            sel = f'[role="treeitem"][aria-level="2"][data-node-id="{node_id}"]'
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                item_locator = loc.first
+                logger.debug("Found curriculum item by node_id: %s", node_id)
+
+        if item_locator is None:
+            sel = f'[role="treeitem"][aria-level="2"][aria-posinset="{position}"]'
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                item_locator = loc.first
+                logger.debug("Found curriculum item by position: %d", position)
+
+        if item_locator is None:
+            # Fallback: get all tree items and pick by index
+            all_items = page.locator('[role="treeitem"][aria-level="2"]')
+            count = await all_items.count()
+            if position <= count:
+                item_locator = all_items.nth(position - 1)
+                logger.debug("Found curriculum item by index fallback: %d/%d", position, count)
+
+        if item_locator is None:
+            raise CourseLaunchError(
+                f"Curriculum item not found: position={position}, node_id={node_id}"
+            )
+
+        # Capture old iframe src before clicking (to detect content change)
+        old_iframe_src = ""
+        iframe_sel = (
+            'iframe#training-iframe, '
+            'iframe[data-testid="curriculumPlayer@coursePlayer"]'
+        )
+        try:
+            iframe_loc = page.locator(iframe_sel).first
+            if await iframe_loc.count() > 0:
+                old_iframe_src = await iframe_loc.get_attribute("src") or ""
+        except Exception:
+            pass
+
+        # Click the item using force=True to bypass iframe overlay
+        try:
+            await item_locator.evaluate("el => el.scrollIntoView({block: 'center'})")
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+        await item_locator.dispatch_event("click")
+        logger.info("Clicked curriculum item %d", position)
+
+        # Wait for iframe src to change (confirms platform loaded new item)
+        src_changed = False
+        for _ in range(30):  # 30 x 0.5s = 15s max
+            try:
+                iframe_loc = page.locator(iframe_sel).first
+                if await iframe_loc.count() > 0:
+                    new_src = await iframe_loc.get_attribute("src") or ""
+                    if new_src and new_src != old_iframe_src:
+                        logger.info("Iframe src changed — new content loading")
+                        src_changed = True
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        if not src_changed:
+            logger.warning(
+                "Iframe src did not change after clicking item %d — "
+                "content may be stale",
+                position,
+            )
+
+        # Wait for new content to fully load
+        await self.session.wait_for_stable_page()
+        await asyncio.sleep(2)
+
+        # Handle "Your training is completed" state — click Launch to re-enter
+        await self._wait_and_click(
+            self.selectors.get("launch_button"),
+            "Launch (re-enter completed item)",
+            timeout_ms=10000,
+            optional=True,
+        )
+
+        # Click fullscreen
+        result.fullscreen_succeeded = await self._wait_and_click(
+            self.selectors.get("fullscreen_button"),
+            "Fullscreen",
+            timeout_ms=10000,
+            optional=True,
+        )
+
+        # Dismiss resume prompt on outer page (wait longer — popup can be slow)
+        resume_dismissed = await self._wait_and_click(
+            self.selectors.get("dismiss_resume_no"),
+            "Dismiss resume prompt (No)",
+            timeout_ms=15000,
+            optional=True,
+        )
+        result.resume_prompt_appeared = resume_dismissed
+
+        # Re-detect content iframe (it may have reloaded)
+        content = await self.detect_content_frame()
+        if isinstance(content, Frame):
+            result.iframe_detected = True
+            result.content_frame = content
+
+            # Dismiss resume prompt inside iframe if not already dismissed
+            if not resume_dismissed:
+                try:
+                    dismiss_sel = self.selectors.get("dismiss_resume_no")
+                    if dismiss_sel:
+                        for sel in [s.strip() for s in dismiss_sel.split(",")]:
+                            no_btn = content.locator(sel)
+                            if await no_btn.count() > 0 and await no_btn.first.is_visible():
+                                await no_btn.first.click()
+                                await asyncio.sleep(1)
+                                logger.info("Dismissed resume prompt inside iframe")
+                                result.resume_prompt_appeared = True
+                                break
+                except Exception as e:
+                    logger.debug("iframe resume dismiss check: %s", e)
+        else:
+            result.content_frame = content
+
         return result
 
     # ------------------------------------------------------------------

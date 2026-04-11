@@ -70,7 +70,7 @@ DEFAULT_SELECTORS: Dict[str, str] = {
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Launch")'
     ),
     "fullscreen_button": '[data-testid="MinimizeIcon"], [aria-label="View Full Screen Mode"]',
-    "dismiss_resume_no": '.uikit-primary-button:has-text("No")',
+    "dismiss_resume_no": '.uikit-primary-button:has-text("No"), button:has-text("No"), a:has-text("No")',
     "exit_course_button": (
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Exit Course")'
     ),

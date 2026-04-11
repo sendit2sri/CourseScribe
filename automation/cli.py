@@ -18,7 +18,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 from automation.config import AutomationConfig
 
@@ -350,8 +350,8 @@ def cmd_review(config: AutomationConfig) -> None:
 
 
 async def cmd_run_all(config: AutomationConfig) -> None:
-    """Handle the 'run-all' command — multi-course pipeline."""
-    await _run_multi_course_loop(config, process_pages=True)
+    """Handle the 'run-all' command — capture screenshots only, no API processing."""
+    await _run_multi_course_loop(config, process_pages=False)
 
 
 async def _run_multi_course_loop(
@@ -419,12 +419,59 @@ async def _run_multi_course_loop(
                 launch_result = await portal.launch_course()
 
                 # Extract curriculum sidebar before navigating into content
+                curriculum_data = None
                 try:
                     curriculum_data = await portal.extract_curriculum_from_page()
+
+                    # Filter out "Course Document" items (PDF duplicates)
+                    curriculum_data["items"] = [
+                        item for item in curriculum_data["items"]
+                        if "course document" not in item.get("title", "").lower()
+                    ]
+                    curriculum_data["summary"]["total_items"] = len(
+                        curriculum_data["items"]
+                    )
+
+                    # Replace platform status with our capture status
+                    for item in curriculum_data["items"]:
+                        item["platform_status"] = item.pop("status", "unknown")
+                        if "capture_status" not in item:
+                            item["capture_status"] = "not_captured"
+
                     if curriculum_data["summary"]["total_items"] > 0:
                         curriculum_file = full_course_dir / "curriculum.json"
                         full_course_dir.mkdir(parents=True, exist_ok=True)
                         import json
+
+                        # Merge capture_status from previous run if exists
+                        if curriculum_file.exists():
+                            try:
+                                prev = json.loads(
+                                    curriculum_file.read_text(encoding="utf-8")
+                                )
+                                prev_by_pos = {
+                                    it["position"]: it
+                                    for it in prev.get("items", [])
+                                    if it.get("capture_status")
+                                }
+                                if prev_by_pos:
+                                    for item in curriculum_data["items"]:
+                                        prev_item = prev_by_pos.get(
+                                            item.get("position")
+                                        )
+                                        if prev_item:
+                                            item["capture_status"] = prev_item[
+                                                "capture_status"
+                                            ]
+                                            item["pages_captured"] = prev_item.get(
+                                                "pages_captured", 0
+                                            )
+                                    logger.info(
+                                        "Merged capture status from previous run"
+                                    )
+                            except Exception:
+                                pass
+
                         with open(curriculum_file, 'w', encoding='utf-8') as f:
                             json.dump(curriculum_data, f, indent=2, ensure_ascii=False)
                             f.write('\n')
@@ -436,7 +483,7 @@ async def _run_multi_course_loop(
                 except Exception as e:
                     logger.warning("Could not extract curriculum sidebar: %s", e)
 
-                # Run the per-course capture loop
+                # Run the per-course capture loop with curriculum iteration
                 await _run_single_course(
                     session=session,
                     config=config,
@@ -445,6 +492,8 @@ async def _run_multi_course_loop(
                     skip_titles=targets.skip_titles,
                     process_pages=process_pages,
                     content_frame=launch_result.content_frame,
+                    portal=portal,
+                    curriculum_items=curriculum_data.get("items", []) if curriculum_data else [],
                 )
 
                 # Exit course
@@ -517,12 +566,17 @@ async def _run_single_course(
     skip_titles: List[str],
     process_pages: bool,
     content_frame: Optional[Union[Frame, Page]] = None,
+    portal: Optional[Any] = None,
+    curriculum_items: Optional[List[dict]] = None,
 ) -> None:
     """Run the capture+process loop for a single course (already on the course page).
 
     This is the inner loop extracted from _run_capture_loop(), adapted for
     multi-course orchestration. The caller handles browser start/close and
     tab management.
+
+    When curriculum_items is provided, iterates through each item in the
+    sidebar, capturing all pages per item before moving to the next.
     """
     from automation.capture.navigator import CourseNavigator
     from automation.capture.screenshot import ScreenshotCapture
@@ -545,160 +599,314 @@ async def _run_single_course(
     if content_frame is not None:
         navigator.set_content_frame(content_frame)
     capturer = ScreenshotCapture(session, config, selectors)
+    if content_frame is not None:
+        capturer.set_content_frame(content_frame)
     processor = PageProcessor(config) if process_pages else None
     classifier = ContentClassifier(selectors) if process_pages else None
 
-    # Check for resume
-    resume_pos = manifest.get_resume_position()
-    if resume_pos:
-        logger.info(
-            "Resuming from %s: %s", resume_pos.page_id, resume_pos.page_title
-        )
-        pos = manifest._state.get("current_position", {})
-        navigator.set_position(
-            pos.get("module_index", 1),
-            pos.get("lesson_index", 1),
-            pos.get("page_index", 0),
-        )
-        for pid, state in manifest._page_states.items():
-            if state.url:
-                navigator.mark_url_visited(state.url)
-
-    prev_info = None
     pages_processed = 0
+    curriculum_results: List[dict] = []  # per-item capture tracking
 
-    while not _shutdown_requested:
-        # Detect module/lesson changes
-        if prev_info:
-            await navigator.detect_module_change(prev_info)
-            await navigator.detect_lesson_change(prev_info)
+    # Build the list of curriculum items to iterate.
+    # If no curriculum items provided, use a single dummy entry so the
+    # inner capture loop runs once (legacy behavior).
+    # In curriculum mode, always start fresh (no page-level resume).
+    # Curriculum-level retry is handled via capture_status in curriculum.json.
+    if curriculum_items and portal:
+        items_to_process = curriculum_items
+        fresh_start = True
+    else:
+        items_to_process = [None]  # single pass, no sidebar clicking
+        fresh_start = False
 
-        # Get current page info
-        page_info = await navigator.get_current_page_info()
-
-        # Skip if already captured (resume scenario)
-        if manifest.is_page_captured(page_info.page_id):
-            logger.info("Skipping already-captured %s", page_info.page_id)
-        else:
-            # Register page
-            manifest.add_page(page_info)
-            manifest.update_position(page_info)
-
-            # Check skip titles
-            if await navigator.is_skip_page(skip_titles):
-                logger.info(
-                    "Skipping page (matched skip title): [%s] %s",
-                    page_info.page_id,
-                    page_info.page_title,
-                )
-                manifest.mark_skipped(
-                    page_info.page_id,
-                    f"matched skip_titles: {page_info.page_title}",
-                )
-            else:
-                # Expand hidden content
-                await navigator.expand_all_content()
-                await session.wait_for_stable_page()
-
-                # Build lesson directory
-                lesson_dir = (
-                    course_output_dir
-                    / page_info.module_dir_name
-                    / page_info.lesson_dir_name
-                )
-
-                # Capture
-                logger.info(
-                    "Capturing [%s] %s", page_info.page_id, page_info.page_title
-                )
-                capture_result = await capturer.capture_page(page_info, lesson_dir)
-
-                # Fingerprint
-                dom_text = await navigator.extract_dom_text()
-                screenshot_hash = ""
-                dom_text_hash = ""
-                if capture_result.full_page_path:
-                    screenshot_hash = manifest.compute_image_hash(
-                        capture_result.full_page_path
-                    )
-                if dom_text:
-                    dom_text_hash = manifest.compute_text_hash(dom_text)
-
-                # Record capture
-                crop_paths = [
-                    str(p.relative_to(course_output_dir))
-                    for p, _ in capture_result.section_crops
-                ]
-                manifest.mark_captured(
-                    page_info.page_id,
-                    screenshot_path=str(
-                        capture_result.full_page_path.relative_to(course_output_dir)
-                    )
-                    if capture_result.full_page_path
-                    else "",
-                    screenshot_hash=screenshot_hash,
-                    dom_text_hash=dom_text_hash,
-                    crops=crop_paths,
-                )
-
-                # Process (if not capture-only)
-                if process_pages and processor and classifier:
-                    result = processor.process_page(
-                        capture_result, lesson_dir, classifier
-                    )
-                    if result.success:
-                        manifest.mark_processed(
-                            page_info.page_id,
-                            raw_text_path=str(
-                                result.raw_text_path.relative_to(course_output_dir)
-                            )
-                            if result.raw_text_path
-                            else "",
-                            cleaned_path=str(
-                                result.cleaned_md_path.relative_to(course_output_dir)
-                            )
-                            if result.cleaned_md_path
-                            else "",
-                            content_type=result.content_type,
-                            ocr_char_count=result.raw_text_length,
-                            low_quality=result.low_quality,
-                            review_reason=result.review_reason,
-                        )
-                        if result.cost_data:
-                            manifest.update_cost(
-                                result.cost_data.get("cost", 0),
-                                result.cost_data.get("requests", 0),
-                                result.cost_data.get("input_tokens", 0),
-                                result.cost_data.get("output_tokens", 0),
-                            )
-                    else:
-                        manifest.mark_failed(
-                            page_info.page_id,
-                            "processing",
-                            result.error or "Unknown error",
-                        )
-
-                pages_processed += 1
-
-        # Save state after every page
-        manifest.save()
-
-        # Delay between pages
-        if config.page_delay > 0:
-            await asyncio.sleep(config.page_delay)
-
-        # Try to navigate to next page
-        prev_info = page_info
-        next_info = await navigator.go_next()
-        if next_info is None:
-            logger.info("Reached end of course")
+    for item_idx, cur_item in enumerate(items_to_process):
+        if _shutdown_requested:
             break
+
+        if cur_item is not None:
+            position = cur_item.get("position", item_idx + 1)
+            node_id = cur_item.get("node_id", "")
+            title = cur_item.get("title", f"Item {position}")
+
+            # Skip already-captured items (retry-only mode)
+            if cur_item.get("capture_status") == "captured" and cur_item.get("pages_captured", 0) > 0:
+                logger.info(
+                    "Skipping already-captured item %d/%d: %s (%d pages)",
+                    position, len(items_to_process), title,
+                    cur_item["pages_captured"],
+                )
+                curriculum_results.append({
+                    "position": position,
+                    "title": title,
+                    "status": "captured",
+                    "pages_captured": cur_item["pages_captured"],
+                })
+                continue
+
+            logger.info(
+                "Opening curriculum item %d/%d: %s",
+                position,
+                len(items_to_process),
+                title,
+            )
+
+            # Click the curriculum item in the sidebar (with retries)
+            item_result = None
+            for attempt in range(3):
+                try:
+                    item_result = await portal.click_curriculum_item(position, node_id)
+                    # Update content frame (iframe may have reloaded)
+                    if item_result.content_frame is not None:
+                        navigator.set_content_frame(item_result.content_frame)
+                        capturer.set_content_frame(item_result.content_frame)
+                    break  # success
+                except Exception as e:
+                    logger.warning(
+                        "Attempt %d/3 failed for curriculum item %d (%s): %s",
+                        attempt + 1, position, title, e,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(3)
+
+            if item_result is None:
+                logger.error(
+                    "Skipping curriculum item %d (%s) after 3 failed attempts",
+                    position, title,
+                )
+                curriculum_results.append({
+                    "position": position,
+                    "title": title,
+                    "status": "failed",
+                    "pages_captured": 0,
+                })
+                continue
+
+            # Reset navigator for the new curriculum item
+            navigator.reset_for_new_item(item_idx + 1, module_name=title)
+        else:
+            # Legacy single-pass mode — check for resume
+            resume_pos = manifest.get_resume_position()
+            if resume_pos:
+                logger.info(
+                    "Resuming from %s: %s",
+                    resume_pos.page_id,
+                    resume_pos.page_title,
+                )
+                pos = manifest._state.get("current_position", {})
+                navigator.set_position(
+                    pos.get("module_index", 1),
+                    pos.get("lesson_index", 1),
+                    pos.get("page_index", 0),
+                )
+                for pid, state in manifest._page_states.items():
+                    if state.url:
+                        navigator.mark_url_visited(state.url)
+
+        # ---- Inner loop: capture all pages for this curriculum item ----
+        item_pages = 0
+        prev_info = None
+
+        while not _shutdown_requested:
+            # Detect module/lesson changes
+            if prev_info:
+                await navigator.detect_module_change(prev_info)
+                await navigator.detect_lesson_change(prev_info)
+
+            # Get current page info
+            page_info = await navigator.get_current_page_info()
+
+            # Skip if already captured (resume scenario — legacy mode only)
+            if not fresh_start and manifest.is_page_captured(page_info.page_id):
+                logger.info("Skipping already-captured %s", page_info.page_id)
+            else:
+                # Register page
+                manifest.add_page(page_info)
+                manifest.update_position(page_info)
+
+                # Check skip titles
+                if await navigator.is_skip_page(skip_titles):
+                    logger.info(
+                        "Skipping page (matched skip title): [%s] %s",
+                        page_info.page_id,
+                        page_info.page_title,
+                    )
+                    manifest.mark_skipped(
+                        page_info.page_id,
+                        f"matched skip_titles: {page_info.page_title}",
+                    )
+                else:
+                    # Expand hidden content
+                    await navigator.expand_all_content()
+                    await session.wait_for_stable_page()
+
+                    # Build lesson directory
+                    lesson_dir = (
+                        course_output_dir
+                        / page_info.module_dir_name
+                        / page_info.lesson_dir_name
+                    )
+
+                    # Capture
+                    logger.info(
+                        "Capturing [%s] %s", page_info.page_id, page_info.page_title
+                    )
+                    capture_result = await capturer.capture_page(
+                        page_info, lesson_dir
+                    )
+
+                    # Fingerprint
+                    dom_text = await navigator.extract_dom_text()
+                    screenshot_hash = ""
+                    dom_text_hash = ""
+                    if capture_result.full_page_path:
+                        screenshot_hash = manifest.compute_image_hash(
+                            capture_result.full_page_path
+                        )
+                    if dom_text:
+                        dom_text_hash = manifest.compute_text_hash(dom_text)
+
+                    # Record capture
+                    crop_paths = [
+                        str(p.relative_to(course_output_dir))
+                        for p, _ in capture_result.section_crops
+                    ]
+                    manifest.mark_captured(
+                        page_info.page_id,
+                        screenshot_path=str(
+                            capture_result.full_page_path.relative_to(
+                                course_output_dir
+                            )
+                        )
+                        if capture_result.full_page_path
+                        else "",
+                        screenshot_hash=screenshot_hash,
+                        dom_text_hash=dom_text_hash,
+                        crops=crop_paths,
+                    )
+
+                    # Process (if not capture-only)
+                    if process_pages and processor and classifier:
+                        result = processor.process_page(
+                            capture_result, lesson_dir, classifier
+                        )
+                        if result.success:
+                            manifest.mark_processed(
+                                page_info.page_id,
+                                raw_text_path=str(
+                                    result.raw_text_path.relative_to(
+                                        course_output_dir
+                                    )
+                                )
+                                if result.raw_text_path
+                                else "",
+                                cleaned_path=str(
+                                    result.cleaned_md_path.relative_to(
+                                        course_output_dir
+                                    )
+                                )
+                                if result.cleaned_md_path
+                                else "",
+                                content_type=result.content_type,
+                                ocr_char_count=result.raw_text_length,
+                                low_quality=result.low_quality,
+                                review_reason=result.review_reason,
+                            )
+                            if result.cost_data:
+                                manifest.update_cost(
+                                    result.cost_data.get("cost", 0),
+                                    result.cost_data.get("requests", 0),
+                                    result.cost_data.get("input_tokens", 0),
+                                    result.cost_data.get("output_tokens", 0),
+                                )
+                        else:
+                            manifest.mark_failed(
+                                page_info.page_id,
+                                "processing",
+                                result.error or "Unknown error",
+                            )
+
+                    pages_processed += 1
+                    item_pages += 1
+
+            # Save state after every page
+            manifest.save()
+
+            # Delay between pages
+            if config.page_delay > 0:
+                await asyncio.sleep(config.page_delay)
+
+            # Try to navigate to next page
+            prev_info = page_info
+            next_info = await navigator.go_next()
+            if next_info is None:
+                if cur_item is not None:
+                    logger.info(
+                        "Reached end of curriculum item %d: %s",
+                        cur_item.get("position", item_idx + 1),
+                        cur_item.get("title", ""),
+                    )
+                else:
+                    logger.info("Reached end of course")
+                break
+
+        # Record per-item result
+        if cur_item is not None:
+            curriculum_results.append({
+                "position": cur_item.get("position", item_idx + 1),
+                "title": cur_item.get("title", ""),
+                "status": "captured" if item_pages > 0 else "no_pages",
+                "pages_captured": item_pages,
+            })
 
     # Final save
     manifest.save()
 
     # Print per-course summary
     print("\n" + manifest.summary_text())
+
+    # Print curriculum capture summary if we iterated items
+    if curriculum_results:
+        total_items = len(curriculum_results)
+        ok_count = sum(1 for r in curriculum_results if r["status"] == "captured")
+        fail_count = sum(1 for r in curriculum_results if r["status"] == "failed")
+        no_pages_count = sum(1 for r in curriculum_results if r["status"] == "no_pages")
+        total_pages = sum(r["pages_captured"] for r in curriculum_results)
+
+        print(f"\nCurriculum Capture Summary ({total_items} items)")
+        print("=" * 50)
+        for r in curriculum_results:
+            icon = {"captured": "[OK]  ", "failed": "[FAIL]", "no_pages": "[SKIP]"}
+            status = icon.get(r["status"], "[?]   ")
+            pages_str = f"({r['pages_captured']} pages)" if r["pages_captured"] else ""
+            print(f"  {status} {r['position']:2d}. {r['title']} {pages_str}")
+        print(f"\nCaptured: {ok_count}/{total_items} | "
+              f"Failed: {fail_count} | Skipped: {no_pages_count} | "
+              f"Total pages: {total_pages}")
+
+        # Update curriculum.json with capture results
+        import json
+        curriculum_file = course_output_dir / "curriculum.json"
+        if curriculum_file.exists():
+            try:
+                data = json.loads(curriculum_file.read_text(encoding="utf-8"))
+                results_by_pos = {r["position"]: r for r in curriculum_results}
+                for item in data.get("items", []):
+                    pos = item.get("position", 0)
+                    if pos in results_by_pos:
+                        item["capture_status"] = results_by_pos[pos]["status"]
+                        item["pages_captured"] = results_by_pos[pos]["pages_captured"]
+                data["capture_summary"] = {
+                    "total_items": total_items,
+                    "captured": ok_count,
+                    "failed": fail_count,
+                    "no_pages": no_pages_count,
+                    "total_pages": total_pages,
+                }
+                with open(curriculum_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+            except Exception as e:
+                logger.warning("Could not update curriculum.json: %s", e)
 
     if process_pages and processor:
         cost = processor.get_cumulative_cost()

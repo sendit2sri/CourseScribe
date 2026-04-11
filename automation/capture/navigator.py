@@ -6,6 +6,7 @@ Navigation fallback strategy (ordered):
   3. "Next" button following (universal fallback)
 """
 
+import asyncio
 import logging
 import re
 from typing import List, Optional, Set, Tuple
@@ -33,6 +34,7 @@ class CourseNavigator:
         self._current_module_index: int = 1
         self._current_lesson_index: int = 1
         self._current_page_index: int = 0
+        self._override_module_name: str = ""
         # Loop protection: track (url, title) fingerprint
         self._prev_fingerprint: Optional[tuple] = None
         self._consecutive_same_fingerprint: int = 0
@@ -150,7 +152,13 @@ class CourseNavigator:
         Returns None if no Next button or at end of course.
         """
         page = self.content_page
-        next_sel = self.selectors.get("next_button")
+
+        # Capture DOM text fingerprint before clicking (for SPA change detection)
+        old_text = ""
+        try:
+            old_text = await self.extract_dom_text()
+        except Exception:
+            pass
 
         for selector in self.selectors.get_chain("next_button"):
             try:
@@ -159,42 +167,36 @@ class CourseNavigator:
                     is_disabled = await button.get_attribute("disabled")
                     aria_disabled = await button.get_attribute("aria-disabled")
                     if is_disabled is not None or aria_disabled == "true":
+                        logger.debug("Next button '%s' is disabled", selector)
                         continue
 
-                    old_url = page.url
+                    logger.debug("Clicking Next button: %s", selector)
                     await button.click()
-                    # Wait for navigation or content change
-                    try:
-                        await page.wait_for_url(
-                            lambda url: url != old_url, timeout=10000
-                        )
-                    except Exception:
-                        # URL might not change (SPA) — wait for DOM change instead
-                        await self.session.wait_for_stable_page()
 
-                    new_url = await self.session.get_current_url()
+                    # Wait for content to change (SPA/iframe: URL won't change)
+                    await self.session.wait_for_stable_page()
+                    await asyncio.sleep(1)
 
-                    # Loop detection
-                    if new_url in self._visited_urls and new_url == old_url:
-                        logger.warning("Next click did not change the page")
-                        return None
-
-                    self._visited_urls.add(new_url)
                     self._current_page_index += 1
                     self._page_counter += 1
 
                     info = await self.get_current_page_info()
 
-                    # Loop protection: check fingerprint
-                    fingerprint = (new_url, info.page_title)
+                    # Loop protection: use page_title + DOM text fingerprint
+                    new_text = ""
+                    try:
+                        new_text = await self.extract_dom_text()
+                    except Exception:
+                        pass
+
+                    fingerprint = (info.page_title, new_text[:200])
                     if fingerprint == self._prev_fingerprint:
                         self._consecutive_same_fingerprint += 1
                         if self._consecutive_same_fingerprint >= self._LOOP_THRESHOLD:
                             logger.warning(
-                                "Loop detected: same page repeated %d times after Next "
-                                "(url=%s, title=%s)",
+                                "Loop detected: same content repeated %d times "
+                                "(title=%s)",
                                 self._consecutive_same_fingerprint,
-                                new_url,
                                 info.page_title,
                             )
                             return None
@@ -307,8 +309,23 @@ class CourseNavigator:
         self._current_module_index = 1
         self._current_lesson_index = 1
         self._current_page_index = 0
+        self._override_module_name = ""
         self._prev_fingerprint = None
         self._consecutive_same_fingerprint = 0
+
+    def reset_for_new_item(self, item_index: int, module_name: str = "") -> None:
+        """Lighter reset for switching curriculum items within a course.
+
+        Clears fingerprint/loop tracking and resets page index, but sets
+        module_index to item_index so page IDs stay unique across items.
+        """
+        self._current_module_index = item_index
+        self._current_lesson_index = 1
+        self._current_page_index = 0
+        self._override_module_name = module_name
+        self._prev_fingerprint = None
+        self._consecutive_same_fingerprint = 0
+        self._visited_urls.clear()
 
     async def is_skip_page(self, skip_titles: List[str]) -> bool:
         """Multi-source skip detection for the current page.
@@ -389,6 +406,9 @@ class CourseNavigator:
 
     async def _extract_module_name(self, page: Page) -> str:
         """Try to extract current module name from DOM."""
+        if self._override_module_name:
+            return self._override_module_name
+
         name = await self._extract_text(page, self.selectors.get("module_name"))
         if name:
             return name

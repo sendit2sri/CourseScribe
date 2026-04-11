@@ -148,11 +148,11 @@ class CoursesStateManager:
                 logger.info("Added course: %s -> %s/", course_name, code)
 
     def get_pending_courses(self) -> List[str]:
-        """Return course names with status pending or in_progress (in targets order)."""
+        """Return course names not yet completed (pending, in_progress, or failed)."""
         return [
             name
             for name, entry in self._courses.items()
-            if entry.status in (COURSE_PENDING, COURSE_IN_PROGRESS)
+            if entry.status in (COURSE_PENDING, COURSE_IN_PROGRESS, COURSE_FAILED)
         ]
 
     def is_course_complete(self, course_name: str) -> bool:
