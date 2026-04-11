@@ -8,9 +8,9 @@ Mode C (section):    element.screenshot() on DOM-detected regions — when --ena
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
-from playwright.async_api import Page
+from playwright.async_api import Frame, Page
 
 from automation.capture.browser import BrowserSession
 from automation.config import AutomationConfig
@@ -50,6 +50,18 @@ class ScreenshotCapture:
         self.session = session
         self.config = config
         self.selectors = selectors
+        self._content_frame: Optional[Union[Frame, Page]] = None
+
+    def set_content_frame(self, frame: Optional[Union[Frame, Page]]) -> None:
+        """Set the content frame (iframe) where course content lives."""
+        self._content_frame = frame
+
+    @property
+    def content_page(self) -> Union[Frame, Page]:
+        """Return the content frame if set, otherwise the session page."""
+        if self._content_frame is not None:
+            return self._content_frame
+        return self.session.page
 
     async def capture_page(
         self, page_info: PageInfo, lesson_dir: Path
@@ -104,8 +116,30 @@ class ScreenshotCapture:
         return result
 
     async def capture_full_page(self, output_path: Path) -> Path:
-        """Mode A: Capture the entire page as a single screenshot."""
+        """Mode A: Capture the content area as a single screenshot.
+
+        When a content iframe is set, screenshots just the iframe element
+        (excludes sidebar, header). Falls back to full-page if no iframe.
+        """
         page = self.session.page
+
+        # If content is in an iframe, screenshot just the iframe element
+        if self._content_frame is not None and self._content_frame != page:
+            iframe_sel = (
+                'iframe#training-iframe, '
+                'iframe[data-testid="curriculumPlayer@coursePlayer"]'
+            )
+            try:
+                iframe_el = await page.query_selector(iframe_sel)
+                if iframe_el:
+                    await iframe_el.screenshot(path=str(output_path))
+                    logger.info(f"Content-frame screenshot: {output_path.name}")
+                    return output_path
+            except Exception as e:
+                logger.debug(
+                    f"Iframe screenshot failed, falling back to full page: {e}"
+                )
+
         await page.screenshot(path=str(output_path), full_page=True)
         logger.info(f"Full-page screenshot: {output_path.name}")
         return output_path
@@ -149,7 +183,7 @@ class ScreenshotCapture:
         Targets tables, diagrams, T24 screenshots via selector profiles.
         Returns list of (path, content_type_label) tuples.
         """
-        page = self.session.page
+        page = self.content_page
         crops: List[Tuple[Path, str]] = []
         crop_index = 1
 
