@@ -126,38 +126,27 @@ class PageProcessor:
     ) -> ProcessingResult:
         """Full processing pipeline for one captured page.
 
-        Steps:
-          1. Extract text via Tesseract (reusing coursescribe OCR)
-          2. Classify content type
-          3. Build page-aware prompt with module/lesson context
-          4. Send OCR text + image to AI for cleaning
-          5. Process section crops if present
-          6. Save raw_text/ and cleaned/ files
-          7. Flag low-quality pages for review
+        Two modes:
+          - Vision mode (default): send full screenshot directly to AI
+          - Legacy OCR mode: Tesseract OCR → AI cleaning → crop processing
         """
         self._lazy_init()
 
         page_info = capture_result.page_info
         result = ProcessingResult(page_info=page_info)
 
-        raw_text_dir = lesson_dir / "raw_text"
         cleaned_dir = lesson_dir / "cleaned"
-        raw_text_dir.mkdir(parents=True, exist_ok=True)
         cleaned_dir.mkdir(parents=True, exist_ok=True)
 
         prefix = f"page_{page_info.page_index:03d}"
 
         try:
-            # Step 1: OCR extraction
             screenshot_path = capture_result.full_page_path
             if not screenshot_path or not screenshot_path.exists():
                 result.error = "No screenshot available"
                 return result
 
-            raw_text, ocr_metadata = self._extract_text(screenshot_path)
-            result.raw_text_length = len(raw_text)
-
-            # Step 2: Content classification
+            # Content classification (works for both modes)
             content_type = "text_heavy"
             if classifier and screenshot_path.exists():
                 try:
@@ -166,41 +155,69 @@ class PageProcessor:
                     pass
             result.content_type = content_type
 
-            # Step 3: Save raw text
-            raw_path = raw_text_dir / f"{prefix}_raw.txt"
-            raw_path.write_text(raw_text, encoding="utf-8")
-            result.raw_text_path = raw_path
-
-            # Step 4: AI cleaning with page context and content-type prompt
-            cleaned_text = self._clean_page(
-                raw_text, screenshot_path, page_info, content_type
-            )
-            result.ai_request_count += 1
-
-            # Step 5: Process section crops if present
-            if capture_result.section_crops:
-                crop_texts = self._process_crops(
-                    capture_result.section_crops, page_info
+            if self.config.vision_mode:
+                # Vision-first: send full screenshot directly to AI
+                logger.info(
+                    "Using vision-first extraction for page %s",
+                    page_info.page_title,
                 )
-                result.ai_request_count += len(crop_texts)
-                if crop_texts:
-                    cleaned_text += "\n\n---\n\n## Content Sections\n\n"
-                    cleaned_text += "\n\n".join(crop_texts)
+                cleaned_text = self._extract_via_vision(
+                    screenshot_path, page_info, content_type
+                )
+                result.ai_request_count += 1
 
-            # Step 6: Save cleaned markdown
+                # Vision quality check
+                if self._is_low_quality_vision_response(cleaned_text):
+                    result.low_quality = True
+                    result.review_reason = "Vision extraction returned very little content"
+
+            else:
+                # Legacy OCR pipeline
+                logger.info(
+                    "Using legacy OCR pipeline for page %s",
+                    page_info.page_title,
+                )
+                raw_text_dir = lesson_dir / "raw_text"
+                raw_text_dir.mkdir(parents=True, exist_ok=True)
+
+                raw_text, ocr_metadata = self._extract_text(screenshot_path)
+                result.raw_text_length = len(raw_text)
+
+                # Save raw text
+                raw_path = raw_text_dir / f"{prefix}_raw.txt"
+                raw_path.write_text(raw_text, encoding="utf-8")
+                result.raw_text_path = raw_path
+
+                # AI cleaning with page context
+                cleaned_text = self._clean_page(
+                    raw_text, screenshot_path, page_info, content_type
+                )
+                result.ai_request_count += 1
+
+                # Process section crops if present
+                if capture_result.section_crops:
+                    crop_texts = self._process_crops(
+                        capture_result.section_crops, page_info
+                    )
+                    result.ai_request_count += len(crop_texts)
+                    if crop_texts:
+                        cleaned_text += "\n\n---\n\n## Content Sections\n\n"
+                        cleaned_text += "\n\n".join(crop_texts)
+
+                # OCR quality check
+                if result.raw_text_length < self.config.low_quality_char_threshold:
+                    result.low_quality = True
+                    result.review_reason = (
+                        f"Low OCR character count ({result.raw_text_length} chars)"
+                    )
+                elif len(cleaned_text) < result.raw_text_length * 0.2:
+                    result.low_quality = True
+                    result.review_reason = "AI output much shorter than OCR input"
+
+            # Save cleaned markdown
             cleaned_path = cleaned_dir / f"{prefix}_cleaned.md"
             cleaned_path.write_text(cleaned_text, encoding="utf-8")
             result.cleaned_md_path = cleaned_path
-
-            # Step 7: Quality check
-            if result.raw_text_length < self.config.low_quality_char_threshold:
-                result.low_quality = True
-                result.review_reason = (
-                    f"Low OCR character count ({result.raw_text_length} chars)"
-                )
-            elif len(cleaned_text) < result.raw_text_length * 0.2:
-                result.low_quality = True
-                result.review_reason = "AI output much shorter than OCR input"
 
             # Cost tracking
             if self._cost_tracker:
@@ -214,8 +231,9 @@ class PageProcessor:
 
             result.success = True
             logger.info(
-                f"Processed {prefix}: {result.raw_text_length} chars, "
-                f"type={content_type}, quality={'LOW' if result.low_quality else 'OK'}"
+                f"Processed {prefix}: type={content_type}, "
+                f"mode={'vision' if self.config.vision_mode else 'ocr'}, "
+                f"quality={'LOW' if result.low_quality else 'OK'}"
             )
 
         except Exception as e:
@@ -231,6 +249,82 @@ class PageProcessor:
         except Exception as e:
             logger.warning(f"OCR extraction failed: {e}, using empty text")
             return "", {"error": str(e)}
+
+    def _extract_via_vision(
+        self,
+        image_path: Path,
+        page_info: PageInfo,
+        content_type: str,
+    ) -> str:
+        """Send full screenshot directly to AI for content extraction."""
+        content_type = content_type or "general"
+
+        if content_type == "table":
+            content_type_extension = (
+                "\n- Reproduce all visible tables as valid Markdown tables\n"
+                "- Preserve row/column relationships exactly\n"
+            )
+        elif content_type == "diagram":
+            content_type_extension = (
+                "\n- Describe diagrams, flowcharts, trees, and boxes clearly "
+                "in Markdown\n"
+                "- Include all visible node labels, arrows, branches, and "
+                "relationships\n"
+            )
+        else:
+            content_type_extension = (
+                "\n- Preserve headings, bullets, numbered steps, and "
+                "paragraph structure\n"
+            )
+
+        system_prompt = (
+            "You are an expert at extracting structured content from T24 "
+            "Temenos banking course screenshots.\n\n"
+            "Extract ALL meaningful visible content from the screenshot.\n\n"
+            f"Context:\n"
+            f"- Module: {page_info.module_name}\n"
+            f"- Lesson: {page_info.lesson_name}\n"
+            f"- Page: {page_info.page_title}\n\n"
+            "Rules:\n"
+            "- Extract text exactly as shown whenever readable\n"
+            "- Preserve T24 field names, service names, transaction codes, "
+            "identifiers, and abbreviations exactly\n"
+            "- Reproduce tables as Markdown tables with exact values and "
+            "headers\n"
+            "- Describe diagrams/flowcharts/trees with all visible nodes, "
+            "labels, and connections\n"
+            "- Preserve section hierarchy using Markdown headings and "
+            "bullets\n"
+            "- Ignore navigation UI, browser chrome, sidebars, page "
+            "counters, zoom controls, and next/previous buttons\n"
+            "- Do not invent unreadable text; mark uncertain content as "
+            "[unclear]\n"
+            "- Output only clean Markdown\n"
+            + content_type_extension
+        )
+
+        user_prompt = (
+            "Extract all meaningful content from this course page "
+            "screenshot into clean Markdown."
+        )
+
+        return self._make_ai_request(system_prompt, user_prompt, image_path)
+
+    @staticmethod
+    def _is_low_quality_vision_response(text: str) -> bool:
+        """Check if vision extraction returned too little content."""
+        if not text:
+            return True
+        stripped = text.strip()
+        if len(stripped) < 50:
+            return True
+        if stripped in (
+            "[unclear]",
+            "No readable content found.",
+            "No content detected.",
+        ):
+            return True
+        return False
 
     def _clean_page(
         self,

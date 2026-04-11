@@ -74,6 +74,7 @@ class AutomationConfig:
     model: Optional[str] = None
     content_type: str = "course"  # "course" | "presentation" | "technical"
     enable_cost_tracking: bool = False
+    vision_mode: bool = True  # True = send full screenshot directly to AI
 
     # Operation mode
     capture_only: bool = False
