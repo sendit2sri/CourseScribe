@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     ai_args.add_argument("--content-type", choices=["course", "presentation", "technical"],
                          default="course")
     ai_args.add_argument("--cost-tracking", action="store_true")
+    ai_args.add_argument("--vision-mode", dest="vision_mode", action="store_true",
+                         help="Use vision-first extraction: send full screenshot directly to AI")
+    ai_args.add_argument("--no-vision-mode", dest="vision_mode", action="store_false",
+                         help="Use legacy OCR + AI cleaning pipeline")
+    ai_args.set_defaults(vision_mode=True)
 
     # Capture arguments
     capture_args = argparse.ArgumentParser(add_help=False)
@@ -165,6 +170,8 @@ def args_to_config(args: argparse.Namespace) -> AutomationConfig:
         config.content_type = args.content_type
     if hasattr(args, "cost_tracking"):
         config.enable_cost_tracking = args.cost_tracking
+    if hasattr(args, "vision_mode"):
+        config.vision_mode = args.vision_mode
 
     # Capture args
     if hasattr(args, "enable_crops"):
