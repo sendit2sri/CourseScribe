@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple, Union
 from playwright.async_api import Frame, Page
 
 from automation.capture.browser import BrowserSession
+from automation.capture.cropper import ContentCropper
 from automation.config import AutomationConfig
 from automation.selectors import SelectorProfile
 from automation.state.manifest import PageInfo
@@ -181,13 +182,16 @@ class ScreenshotCapture:
         """Mode C: Find and screenshot specific DOM elements.
 
         Targets tables, diagrams, T24 screenshots via selector profiles.
+        Uses a collect-then-filter approach to eliminate redundant crops:
+        containment, near-duplicate (IoU), clipping, and minimum-height filters.
         Returns list of (path, content_type_label) tuples.
         """
         page = self.content_page
         crops: List[Tuple[Path, str]] = []
-        crop_index = 1
 
-        # Define what to look for
+        # --- Phase 1: Collect candidates ---
+        candidates = []  # (element_handle, box_dict, label)
+
         region_types = [
             ("tables", "table"),
             ("diagrams", "diagram"),
@@ -199,25 +203,144 @@ class ScreenshotCapture:
                 try:
                     elements = await page.query_selector_all(selector)
                     for el in elements:
-                        # Skip tiny or invisible elements
                         box = await el.bounding_box()
-                        if not box or box["width"] < 50 or box["height"] < 30:
+                        if not box or box["width"] < 50:
                             continue
-
-                        path = output_dir / f"{prefix}_crop_{crop_index:02d}_{label}.png"
-                        try:
-                            await el.screenshot(path=str(path))
-                            crops.append((path, label))
-                            logger.debug(
-                                f"Section crop {crop_index}: {label} "
-                                f"({box['width']:.0f}x{box['height']:.0f})"
-                            )
-                            crop_index += 1
-                        except Exception as e:
-                            logger.debug(f"Could not screenshot element: {e}")
+                        candidates.append((el, box, label))
                 except Exception as e:
                     logger.debug(f"Selector '{selector}' failed: {e}")
                     continue
+
+        if not candidates:
+            # OpenCV fallback when DOM selectors find nothing
+            full_page_path = output_dir / f"{prefix}_full.png"
+            if full_page_path.exists():
+                try:
+                    cropper = ContentCropper()
+                    ocv_crops = cropper.crop_all_regions(
+                        full_page_path, output_dir, prefix
+                    )
+                    for path, region_type in ocv_crops:
+                        crops.append((path, region_type))
+                    if ocv_crops:
+                        logger.info(
+                            f"OpenCV fallback: {len(ocv_crops)} regions detected"
+                        )
+                except Exception as e:
+                    logger.warning(f"OpenCV crop detection failed: {e}")
+            return crops
+
+        # --- Phase 2: Filter ---
+
+        def _rect(b):
+            return (b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"])
+
+        def _area(b):
+            return b["width"] * b["height"]
+
+        def _intersection_area(r1, r2):
+            x1 = max(r1[0], r2[0])
+            y1 = max(r1[1], r2[1])
+            x2 = min(r1[2], r2[2])
+            y2 = min(r1[3], r2[3])
+            if x2 <= x1 or y2 <= y1:
+                return 0
+            return (x2 - x1) * (y2 - y1)
+
+        def _iou(box_a, box_b):
+            r1, r2 = _rect(box_a), _rect(box_b)
+            inter = _intersection_area(r1, r2)
+            union = _area(box_a) + _area(box_b) - inter
+            return inter / union if union > 0 else 0
+
+        def _contains(outer, inner, margin=10):
+            ro, ri = _rect(outer), _rect(inner)
+            return (
+                ri[0] >= ro[0] - margin
+                and ri[1] >= ro[1] - margin
+                and ri[2] <= ro[2] + margin
+                and ri[3] <= ro[3] + margin
+            )
+
+        # 2a. Viewport clipping — reject elements with negative coords
+        #     or extending beyond content width
+        try:
+            vp_bounds = await page.evaluate(
+                "() => ({ width: document.documentElement.clientWidth })"
+            )
+            vp_width = vp_bounds["width"]
+        except Exception:
+            vp_width = 1920
+
+        CLIP_MARGIN = 5
+        candidates = [
+            (el, box, label) for el, box, label in candidates
+            if _rect(box)[0] >= -CLIP_MARGIN
+            and _rect(box)[2] <= vp_width + CLIP_MARGIN
+        ]
+
+        # 2b. Minimum height 80px — eliminates thin header-bar-only crops
+        MIN_CROP_HEIGHT = 80
+        before = len(candidates)
+        candidates = [
+            (el, box, label) for el, box, label in candidates
+            if box["height"] >= MIN_CROP_HEIGHT
+        ]
+        if len(candidates) < before:
+            logger.debug(
+                "Height filter removed %d short elements",
+                before - len(candidates),
+            )
+
+        # 2c. Containment filter — sort by area desc, skip elements
+        #     fully inside a larger kept element
+        candidates.sort(key=lambda c: _area(c[1]), reverse=True)
+        kept = []
+        for el, box, label in candidates:
+            if any(_contains(kb, box) for _, kb, _ in kept):
+                logger.debug(
+                    f"Skipping contained element: {label} "
+                    f"({box['width']:.0f}x{box['height']:.0f})"
+                )
+                continue
+            kept.append((el, box, label))
+        candidates = kept
+
+        # 2d. IoU near-duplicate filter — drop smaller of two boxes
+        #     overlapping > 70%
+        IOU_THRESHOLD = 0.7
+        to_remove = set()
+        for i in range(len(candidates)):
+            if i in to_remove:
+                continue
+            for j in range(i + 1, len(candidates)):
+                if j in to_remove:
+                    continue
+                if _iou(candidates[i][1], candidates[j][1]) > IOU_THRESHOLD:
+                    to_remove.add(j)
+                    logger.debug(
+                        f"Removing near-duplicate: {candidates[j][2]} "
+                        f"({candidates[j][1]['width']:.0f}x"
+                        f"{candidates[j][1]['height']:.0f})"
+                    )
+        candidates = [
+            c for idx, c in enumerate(candidates) if idx not in to_remove
+        ]
+
+        # --- Phase 3: Screenshot survivors ---
+        crop_index = 1
+        for el, box, label in candidates:
+            path = output_dir / f"{prefix}_crop_{crop_index:02d}_{label}.png"
+            try:
+                await el.screenshot(path=str(path))
+                crops.append((path, label))
+                logger.debug(
+                    f"Section crop {crop_index}: {label} "
+                    f"({box['width']:.0f}x{box['height']:.0f})"
+                )
+                crop_index += 1
+            except Exception as e:
+                logger.debug(f"Could not screenshot element: {e}")
 
         if crops:
             logger.info(f"Section crops: {len(crops)} regions captured")

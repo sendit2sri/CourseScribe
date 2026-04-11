@@ -24,4 +24,8 @@ python extract_courses.py catalog.html --category "Core Banking" --pathway "Accr
 
 python -m automation login
 
-python -m automation run-all --targets-file targets.json
+python -m automation run-all --targets-file targets.json --enable-crops
+
+--enable-crops
+
+  - Log output shows filter messages (use --log-level DEBUG)  
