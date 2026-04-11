@@ -738,6 +738,7 @@ async def _run_single_course(
                     # Expand hidden content
                     await navigator.expand_all_content()
                     await session.wait_for_stable_page()
+                    await session.wait_for_content_ready(selectors)
 
                     # Build lesson directory
                     lesson_dir = (
@@ -1006,6 +1007,7 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
                 # Expand hidden content
                 await navigator.expand_all_content()
                 await session.wait_for_stable_page()
+                await session.wait_for_content_ready(selectors)
 
                 # Build lesson directory
                 lesson_dir = (
