@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import random
 import signal
 import sys
 import time
@@ -297,7 +298,7 @@ async def cmd_process(config: AutomationConfig) -> None:
         manifest.save()
 
         if config.page_delay > 0:
-            time.sleep(config.page_delay)
+            time.sleep(config.page_delay * random.uniform(0.7, 1.5))
 
     # Print summary
     print("\n" + manifest.summary_text())
@@ -713,149 +714,167 @@ async def _run_single_course(
         item_pages = 0
         prev_info = None
 
+        _frame_retried = False
         while not _shutdown_requested:
-            # Detect module/lesson changes
-            if prev_info:
-                await navigator.detect_module_change(prev_info)
-                await navigator.detect_lesson_change(prev_info)
+            try:
+                # Detect module/lesson changes
+                if prev_info:
+                    await navigator.detect_module_change(prev_info)
+                    await navigator.detect_lesson_change(prev_info)
 
-            # Get current page info
-            page_info = await navigator.get_current_page_info()
+                # Get current page info
+                page_info = await navigator.get_current_page_info()
 
-            # Skip if already captured (resume scenario — legacy mode only)
-            if not fresh_start and manifest.is_page_captured(page_info.page_id):
-                logger.info("Skipping already-captured %s", page_info.page_id)
-            else:
-                # Register page
-                manifest.add_page(page_info)
-                manifest.update_position(page_info)
-
-                # Check skip titles
-                if await navigator.is_skip_page(skip_titles):
-                    logger.info(
-                        "Skipping page (matched skip title): [%s] %s",
-                        page_info.page_id,
-                        page_info.page_title,
-                    )
-                    manifest.mark_skipped(
-                        page_info.page_id,
-                        f"matched skip_titles: {page_info.page_title}",
-                    )
+                # Skip if already captured (resume scenario — legacy mode only)
+                if not fresh_start and manifest.is_page_captured(page_info.page_id):
+                    logger.info("Skipping already-captured %s", page_info.page_id)
                 else:
-                    # Expand hidden content
-                    await navigator.expand_all_content()
-                    await session.wait_for_stable_page()
-                    await session.wait_for_content_ready(selectors)
+                    # Register page
+                    manifest.add_page(page_info)
+                    manifest.update_position(page_info)
 
-                    # Build lesson directory
-                    lesson_dir = (
-                        course_output_dir
-                        / page_info.module_dir_name
-                        / page_info.lesson_dir_name
-                    )
-
-                    # Capture
-                    logger.info(
-                        "Capturing [%s] %s", page_info.page_id, page_info.page_title
-                    )
-                    capture_result = await capturer.capture_page(
-                        page_info, lesson_dir
-                    )
-
-                    # Fingerprint
-                    dom_text = await navigator.extract_dom_text()
-                    screenshot_hash = ""
-                    dom_text_hash = ""
-                    if capture_result.full_page_path:
-                        screenshot_hash = manifest.compute_image_hash(
-                            capture_result.full_page_path
+                    # Check skip titles
+                    if await navigator.is_skip_page(skip_titles):
+                        logger.info(
+                            "Skipping page (matched skip title): [%s] %s",
+                            page_info.page_id,
+                            page_info.page_title,
                         )
-                    if dom_text:
-                        dom_text_hash = manifest.compute_text_hash(dom_text)
+                        manifest.mark_skipped(
+                            page_info.page_id,
+                            f"matched skip_titles: {page_info.page_title}",
+                        )
+                    else:
+                        # Expand hidden content
+                        await navigator.expand_all_content()
+                        await session.wait_for_stable_page()
+                        await session.wait_for_content_ready(selectors)
 
-                    # Record capture
-                    crop_paths = [
-                        str(p.relative_to(course_output_dir))
-                        for p, _ in capture_result.section_crops
-                    ]
-                    manifest.mark_captured(
-                        page_info.page_id,
-                        screenshot_path=str(
-                            capture_result.full_page_path.relative_to(
-                                course_output_dir
+                        # Build lesson directory
+                        lesson_dir = (
+                            course_output_dir
+                            / page_info.module_dir_name
+                            / page_info.lesson_dir_name
+                        )
+
+                        # Simulate human browsing before capture
+                        await session.random_scroll()
+
+                        # Capture
+                        logger.info(
+                            "Capturing [%s] %s", page_info.page_id, page_info.page_title
+                        )
+                        capture_result = await capturer.capture_page(
+                            page_info, lesson_dir
+                        )
+
+                        # Fingerprint
+                        dom_text = await navigator.extract_dom_text()
+                        screenshot_hash = ""
+                        dom_text_hash = ""
+                        if capture_result.full_page_path:
+                            screenshot_hash = manifest.compute_image_hash(
+                                capture_result.full_page_path
                             )
-                        )
-                        if capture_result.full_page_path
-                        else "",
-                        screenshot_hash=screenshot_hash,
-                        dom_text_hash=dom_text_hash,
-                        crops=crop_paths,
-                    )
+                        if dom_text:
+                            dom_text_hash = manifest.compute_text_hash(dom_text)
 
-                    # Process (if not capture-only)
-                    if process_pages and processor and classifier:
-                        result = processor.process_page(
-                            capture_result, lesson_dir, classifier
+                        # Record capture
+                        crop_paths = [
+                            str(p.relative_to(course_output_dir))
+                            for p, _ in capture_result.section_crops
+                        ]
+                        manifest.mark_captured(
+                            page_info.page_id,
+                            screenshot_path=str(
+                                capture_result.full_page_path.relative_to(
+                                    course_output_dir
+                                )
+                            )
+                            if capture_result.full_page_path
+                            else "",
+                            screenshot_hash=screenshot_hash,
+                            dom_text_hash=dom_text_hash,
+                            crops=crop_paths,
                         )
-                        if result.success:
-                            manifest.mark_processed(
-                                page_info.page_id,
-                                raw_text_path=str(
-                                    result.raw_text_path.relative_to(
-                                        course_output_dir
+
+                        # Process (if not capture-only)
+                        if process_pages and processor and classifier:
+                            result = processor.process_page(
+                                capture_result, lesson_dir, classifier
+                            )
+                            if result.success:
+                                manifest.mark_processed(
+                                    page_info.page_id,
+                                    raw_text_path=str(
+                                        result.raw_text_path.relative_to(
+                                            course_output_dir
+                                        )
                                     )
-                                )
-                                if result.raw_text_path
-                                else "",
-                                cleaned_path=str(
-                                    result.cleaned_md_path.relative_to(
-                                        course_output_dir
+                                    if result.raw_text_path
+                                    else "",
+                                    cleaned_path=str(
+                                        result.cleaned_md_path.relative_to(
+                                            course_output_dir
+                                        )
                                     )
+                                    if result.cleaned_md_path
+                                    else "",
+                                    content_type=result.content_type,
+                                    ocr_char_count=result.raw_text_length,
+                                    low_quality=result.low_quality,
+                                    review_reason=result.review_reason,
                                 )
-                                if result.cleaned_md_path
-                                else "",
-                                content_type=result.content_type,
-                                ocr_char_count=result.raw_text_length,
-                                low_quality=result.low_quality,
-                                review_reason=result.review_reason,
-                            )
-                            if result.cost_data:
-                                manifest.update_cost(
-                                    result.cost_data.get("cost", 0),
-                                    result.cost_data.get("requests", 0),
-                                    result.cost_data.get("input_tokens", 0),
-                                    result.cost_data.get("output_tokens", 0),
+                                if result.cost_data:
+                                    manifest.update_cost(
+                                        result.cost_data.get("cost", 0),
+                                        result.cost_data.get("requests", 0),
+                                        result.cost_data.get("input_tokens", 0),
+                                        result.cost_data.get("output_tokens", 0),
+                                    )
+                            else:
+                                manifest.mark_failed(
+                                    page_info.page_id,
+                                    "processing",
+                                    result.error or "Unknown error",
                                 )
-                        else:
-                            manifest.mark_failed(
-                                page_info.page_id,
-                                "processing",
-                                result.error or "Unknown error",
-                            )
 
-                    pages_processed += 1
-                    item_pages += 1
+                        pages_processed += 1
+                        item_pages += 1
 
-            # Save state after every page
-            manifest.save()
+                # Save state after every page
+                manifest.save()
 
-            # Delay between pages
-            if config.page_delay > 0:
-                await asyncio.sleep(config.page_delay)
+                # Delay between pages
+                if config.page_delay > 0:
+                    await asyncio.sleep(config.page_delay)
 
-            # Try to navigate to next page
-            prev_info = page_info
-            next_info = await navigator.go_next()
-            if next_info is None:
-                if cur_item is not None:
-                    logger.info(
-                        "Reached end of curriculum item %d: %s",
-                        cur_item.get("position", item_idx + 1),
-                        cur_item.get("title", ""),
-                    )
-                else:
-                    logger.info("Reached end of course")
-                break
+                # Try to navigate to next page
+                prev_info = page_info
+                next_info = await navigator.go_next()
+                if next_info is None:
+                    if cur_item is not None:
+                        logger.info(
+                            "Reached end of curriculum item %d: %s",
+                            cur_item.get("position", item_idx + 1),
+                            cur_item.get("title", ""),
+                        )
+                    else:
+                        logger.info("Reached end of course")
+                    break
+
+                _frame_retried = False
+
+            except Exception as e:
+                if "detached" not in str(e).lower() or _frame_retried:
+                    raise
+                logger.warning("Frame detached, re-detecting content frame: %s", e)
+                _frame_retried = True
+                if portal:
+                    fresh_frame = await portal.detect_content_frame()
+                    navigator.set_content_frame(fresh_frame)
+                    capturer.set_content_frame(fresh_frame)
+                continue
 
         # Record per-item result
         if cur_item is not None:
@@ -957,6 +976,7 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
 
     try:
         await session.start()
+        await session.check_stealth()
 
         # Verify session is authenticated; re-login if expired
         await session.ensure_authenticated()
@@ -1022,6 +1042,9 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
                     / page_info.module_dir_name
                     / page_info.lesson_dir_name
                 )
+
+                # Simulate human browsing before capture
+                await session.random_scroll()
 
                 # Capture
                 logger.info(
@@ -1091,9 +1114,9 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
             # Save state after every page
             manifest.save()
 
-            # Delay between pages
+            # Delay between pages (jittered to avoid detection)
             if config.page_delay > 0:
-                await asyncio.sleep(config.page_delay)
+                await asyncio.sleep(config.page_delay * random.uniform(0.7, 1.5))
 
             # Try to navigate to next page
             prev_info = page_info

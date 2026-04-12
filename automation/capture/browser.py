@@ -11,6 +11,7 @@ Login strategy (priority order):
 
 import asyncio
 import logging
+import random
 from typing import Optional
 
 from playwright.async_api import (
@@ -80,6 +81,52 @@ _PORTAL_READY_INDICATORS = (
 )
 
 
+_STEALTH_JS = """
+// Hide navigator.webdriver
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// Fake non-empty plugins array (headless browsers report 0 plugins)
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const arr = [1, 2, 3, 4, 5];
+        arr.item = (i) => arr[i];
+        arr.namedItem = () => null;
+        arr.refresh = () => {};
+        return arr;
+    }
+});
+
+// Ensure languages are populated
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en']
+});
+
+// Add Chrome runtime object (missing in automation)
+if (!window.chrome) {
+    window.chrome = {};
+}
+if (!window.chrome.runtime) {
+    window.chrome.runtime = {};
+}
+
+// Fix Notification permission query
+if (navigator.permissions && navigator.permissions.query) {
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params) =>
+        params.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : origQuery(params);
+}
+
+// Remove CDP artifacts (cdc_ prefixed variables)
+for (const prop of Object.getOwnPropertyNames(window)) {
+    if (prop.startsWith('cdc_') || prop.startsWith('$cdc_')) {
+        delete window[prop];
+    }
+}
+"""
+
+
 class BrowserSession:
     """Manages a persistent Playwright Chromium browser context."""
 
@@ -102,9 +149,19 @@ class BrowserSession:
                 "width": self.config.viewport_width,
                 "height": self.config.viewport_height,
             },
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-popup-blocking",
+                "--disable-infobars",
+            ],
             ignore_default_args=["--enable-automation"],
         )
+
+        # Inject stealth scripts before any page JS runs
+        await self._context.add_init_script(script=_STEALTH_JS)
 
         # Use the first page or create one
         if self._context.pages:
@@ -265,16 +322,16 @@ class BrowserSession:
             logger.warning("Password field not found — cannot auto-login")
             return False
 
-        # Fill credentials
-        await username_el.click()
-        await username_el.fill(username)
-        await password_el.click()
-        await password_el.fill(password)
+        # Fill credentials with human-like typing
+        await self._human_click(username_el)
+        await self._human_type(username_el, username)
+        await self._human_click(password_el)
+        await self._human_type(password_el, password)
 
         # Find and click submit
         submit_el = await self._find_first_visible(self._page, _SUBMIT_SELECTORS)
         if submit_el:
-            await submit_el.click()
+            await self._human_click(submit_el)
         else:
             # Fallback: press Enter on the password field
             await password_el.press("Enter")
@@ -415,6 +472,69 @@ class BrowserSession:
             except Exception:
                 continue
         return None
+
+    # ------------------------------------------------------------------
+    # Human-like interaction helpers
+    # ------------------------------------------------------------------
+
+    async def _human_type(self, element: object, text: str) -> None:
+        """Type text character-by-character with randomized delays."""
+        await element.fill("")  # clear existing value
+        for i, char in enumerate(text):
+            await element.type(char, delay=0)
+            # Base delay: 50-150ms per keystroke
+            delay = random.uniform(0.05, 0.15)
+            # Occasional longer pause every 3-7 characters (simulates thinking)
+            if i > 0 and i % random.randint(3, 7) == 0:
+                delay = random.uniform(0.2, 0.4)
+            await asyncio.sleep(delay)
+
+    async def _human_click(self, element: object) -> None:
+        """Click an element with slight random offset and pre-click delay."""
+        try:
+            box = await element.bounding_box()
+            if box:
+                x = box["x"] + box["width"] / 2 + random.uniform(-5, 5)
+                y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                await asyncio.sleep(random.uniform(0.05, 0.2))
+                await self._page.mouse.click(x, y)
+                return
+        except Exception:
+            pass
+        # Fallback to regular click
+        await element.click()
+
+    async def random_scroll(self) -> None:
+        """Simulate a human glancing at the page before capture."""
+        if not self._page:
+            return
+        scroll_amount = random.randint(100, 400)
+        await self._page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        await self._page.evaluate(f"window.scrollBy(0, -{scroll_amount})")
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+
+    async def check_stealth(self) -> dict:
+        """Run stealth diagnostics and log results. Returns dict of test results."""
+        if not self._page:
+            return {}
+        results = await self._page.evaluate("""() => ({
+            webdriver: navigator.webdriver,
+            plugins_length: navigator.plugins.length,
+            languages: navigator.languages,
+            chrome_exists: !!window.chrome,
+            chrome_runtime_exists: !!(window.chrome && window.chrome.runtime),
+            has_cdc: Object.getOwnPropertyNames(window).some(p => p.startsWith('cdc_')),
+        })""")
+        passed = (
+            results.get("webdriver") is None
+            and results.get("plugins_length", 0) > 0
+            and results.get("chrome_exists") is True
+            and not results.get("has_cdc", True)
+        )
+        status = "PASS" if passed else "FAIL"
+        logger.info("Stealth check [%s]: %s", status, results)
+        return results
 
     # ------------------------------------------------------------------
     # Centralized auth signal collection
