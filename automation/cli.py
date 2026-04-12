@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 # Graceful shutdown flag
 _shutdown_requested = False
 
+# Exit code when batch limit is reached (more pages remain)
+EXIT_BATCH_LIMIT = 2
+
 
 def _signal_handler(signum, frame):
     global _shutdown_requested
@@ -78,9 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Auto-crop tables/diagrams/screenshots")
     capture_args.add_argument("--capture-mode", choices=["full", "viewport", "section"],
                               default="full")
-    capture_args.add_argument("--page-delay", type=float, default=1.0,
-                              help="Delay between pages in seconds")
+    capture_args.add_argument("--page-delay", type=float, default=3.0,
+                              help="Delay between pages in seconds (default: 3.0)")
     capture_args.add_argument("--selectors-file", type=Path, default=None)
+    capture_args.add_argument("--idle-pause-interval", type=str, default="15-30",
+                              help="Pages between reading breaks as 'min-max' (default: 15-30). Set '0' to disable.")
+    capture_args.add_argument("--idle-pause-duration", type=str, default="120-300",
+                              help="Reading break duration range in seconds as 'min-max' (default: 120-300)")
+    capture_args.add_argument("--batch-size", type=int, default=0,
+                              help="Auto-stop after N pages per batch; 0=disabled (default: 0). Exit code 2 when reached.")
     capture_args.add_argument("--dry-run", action="store_true")
 
     # --- Commands ---
@@ -185,6 +194,21 @@ def args_to_config(args: argparse.Namespace) -> AutomationConfig:
         config.selectors_file = args.selectors_file
     if hasattr(args, "dry_run"):
         config.dry_run = args.dry_run
+    if hasattr(args, "idle_pause_interval"):
+        val = args.idle_pause_interval
+        if val == "0":
+            config.idle_pause_interval_min = 0
+            config.idle_pause_interval_max = 0
+        else:
+            lo, hi = val.split("-")
+            config.idle_pause_interval_min = int(lo)
+            config.idle_pause_interval_max = int(hi)
+    if hasattr(args, "idle_pause_duration"):
+        lo, hi = args.idle_pause_duration.split("-")
+        config.idle_pause_duration_min = float(lo)
+        config.idle_pause_duration_max = float(hi)
+    if hasattr(args, "batch_size"):
+        config.batch_size = args.batch_size
 
     # Set operation mode based on command
     config.login_mode = args.command == "login"
@@ -615,6 +639,13 @@ async def _run_single_course(
     pages_processed = 0
     curriculum_results: List[dict] = []  # per-item capture tracking
 
+    # Schedule first reading break at a random page count
+    _next_idle_pause_at_mc = (
+        random.randint(config.idle_pause_interval_min, config.idle_pause_interval_max)
+        if config.idle_pause_interval_min > 0
+        else 0
+    )
+
     # Build the list of curriculum items to iterate.
     # If no curriculum items provided, use a single dummy entry so the
     # inner capture loop runs once (legacy behavior).
@@ -845,9 +876,36 @@ async def _run_single_course(
                 # Save state after every page
                 manifest.save()
 
+                # --- Pacing: batch auto-stop ---
+                if config.batch_size > 0 and pages_processed >= config.batch_size:
+                    logger.info(
+                        "Batch limit reached (%d pages). Exiting — resume to continue.",
+                        pages_processed,
+                    )
+                    print(f"\nBatch complete: {pages_processed} pages captured. "
+                          f"Run again to resume from checkpoint.")
+                    print("\n" + manifest.summary_text())
+                    sys.exit(EXIT_BATCH_LIMIT)
+
+                # --- Pacing: idle reading break ---
+                if _next_idle_pause_at_mc > 0 and pages_processed >= _next_idle_pause_at_mc:
+                    pause_secs = random.uniform(
+                        config.idle_pause_duration_min,
+                        config.idle_pause_duration_max,
+                    )
+                    logger.info(
+                        "Reading break: pausing %.0fs after %d pages",
+                        pause_secs, pages_processed,
+                    )
+                    await asyncio.sleep(pause_secs)
+                    _next_idle_pause_at_mc = pages_processed + random.randint(
+                        config.idle_pause_interval_min,
+                        config.idle_pause_interval_max,
+                    )
+
                 # Delay between pages
                 if config.page_delay > 0:
-                    await asyncio.sleep(config.page_delay)
+                    await asyncio.sleep(config.page_delay * random.uniform(0.7, 1.5))
 
                 # Try to navigate to next page
                 prev_info = page_info
@@ -1014,6 +1072,13 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
         prev_info = None
         pages_processed = 0
 
+        # Schedule first reading break at a random page count
+        _next_idle_pause_at = (
+            random.randint(config.idle_pause_interval_min, config.idle_pause_interval_max)
+            if config.idle_pause_interval_min > 0
+            else 0
+        )
+
         while not _shutdown_requested:
             # Detect module/lesson changes for index tracking
             if prev_info:
@@ -1113,6 +1178,34 @@ async def _run_capture_loop(config: AutomationConfig, process_pages: bool) -> No
 
             # Save state after every page
             manifest.save()
+
+            # --- Pacing: batch auto-stop ---
+            if config.batch_size > 0 and pages_processed >= config.batch_size:
+                logger.info(
+                    "Batch limit reached (%d pages). Exiting — resume to continue.",
+                    pages_processed,
+                )
+                print(f"\nBatch complete: {pages_processed} pages captured. "
+                      f"Run again to resume from checkpoint.")
+                print("\n" + manifest.summary_text())
+                sys.exit(EXIT_BATCH_LIMIT)
+
+            # --- Pacing: idle reading break ---
+            if _next_idle_pause_at > 0 and pages_processed >= _next_idle_pause_at:
+                pause_secs = random.uniform(
+                    config.idle_pause_duration_min,
+                    config.idle_pause_duration_max,
+                )
+                logger.info(
+                    "Reading break: pausing %.0fs after %d pages",
+                    pause_secs, pages_processed,
+                )
+                await asyncio.sleep(pause_secs)
+                # Schedule next break
+                _next_idle_pause_at = pages_processed + random.randint(
+                    config.idle_pause_interval_min,
+                    config.idle_pause_interval_max,
+                )
 
             # Delay between pages (jittered to avoid detection)
             if config.page_delay > 0:
