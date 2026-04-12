@@ -29,11 +29,15 @@ class TargetsConfig:
 
 DEFAULT_BROWSER_DATA_DIR = Path.home() / ".coursescribe" / "browser_profile"
 DEFAULT_OUTPUT_DIR = Path("course_capture")
-DEFAULT_PAGE_DELAY = 1.0
+DEFAULT_PAGE_DELAY = 3.0
 DEFAULT_VIEWPORT_WIDTH = 1920
 DEFAULT_VIEWPORT_HEIGHT = 1080
 DEFAULT_STABLE_WAIT_MS = 30000
 DEFAULT_MUTATION_QUIET_MS = 500
+DEFAULT_IDLE_PAUSE_INTERVAL_MIN = 15
+DEFAULT_IDLE_PAUSE_INTERVAL_MAX = 30
+DEFAULT_IDLE_PAUSE_DURATION_MIN = 120.0
+DEFAULT_IDLE_PAUSE_DURATION_MAX = 300.0
 
 # Minimum OCR char count below which a page is flagged for review
 LOW_QUALITY_CHAR_THRESHOLD = 50
@@ -96,6 +100,15 @@ class AutomationConfig:
     page_delay: float = DEFAULT_PAGE_DELAY
     stable_wait_ms: int = DEFAULT_STABLE_WAIT_MS
     mutation_quiet_ms: int = DEFAULT_MUTATION_QUIET_MS
+
+    # Pacing — idle reading breaks
+    idle_pause_interval_min: int = DEFAULT_IDLE_PAUSE_INTERVAL_MIN
+    idle_pause_interval_max: int = DEFAULT_IDLE_PAUSE_INTERVAL_MAX
+    idle_pause_duration_min: float = DEFAULT_IDLE_PAUSE_DURATION_MIN
+    idle_pause_duration_max: float = DEFAULT_IDLE_PAUSE_DURATION_MAX
+
+    # Pacing — session batching
+    batch_size: int = 0  # 0 = disabled; auto-stop after N pages
 
     # Quality
     low_quality_char_threshold: int = LOW_QUALITY_CHAR_THRESHOLD
@@ -173,6 +186,13 @@ class AutomationConfig:
 
         if self.page_delay < 0:
             errors.append("--page-delay must be non-negative")
+
+        if self.idle_pause_interval_min > self.idle_pause_interval_max:
+            errors.append("--idle-pause-interval min must be <= max")
+        if self.idle_pause_duration_min > self.idle_pause_duration_max:
+            errors.append("--idle-pause-duration min must be <= max")
+        if self.batch_size < 0:
+            errors.append("--batch-size must be non-negative")
 
         if self.selectors_file and not self.selectors_file.exists():
             errors.append(f"Selectors file not found: {self.selectors_file}")
