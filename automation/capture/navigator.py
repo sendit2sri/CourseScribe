@@ -8,6 +8,7 @@ Navigation fallback strategy (ordered):
 
 import asyncio
 import logging
+import random
 import re
 from typing import List, Optional, Set, Tuple
 
@@ -48,6 +49,10 @@ class CourseNavigator:
     def content_page(self) -> Union[Frame, Page]:
         """Return the content frame if set, otherwise the session page."""
         if self._content_frame is not None:
+            if isinstance(self._content_frame, Frame) and self._content_frame.is_detached():
+                logger.warning("Content frame is detached, falling back to page")
+                self._content_frame = None
+                return self.session.page
             return self._content_frame
         return self.session.page
 
@@ -99,8 +104,8 @@ class CourseNavigator:
         if not page_title:
             try:
                 page_title = await page.title() or f"Page {self._page_counter}"
-            except AttributeError:
-                # Frame objects don't have .title()
+            except Exception:
+                # Frame may not support .title() or may be detached
                 page_title = f"Page {self._page_counter}"
 
         # Try to extract module/lesson names from DOM
@@ -175,7 +180,7 @@ class CourseNavigator:
 
                     # Wait for content to change (SPA/iframe: URL won't change)
                     await self.session.wait_for_stable_page()
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
 
                     self._current_page_index += 1
                     self._page_counter += 1
