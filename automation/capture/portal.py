@@ -54,6 +54,8 @@ class LaunchResult:
     iframe_detected: bool = False
     content_frame: Any = None  # Frame or Page
     final_page_title: str = ""
+    old_version_redirected: bool = False
+    old_version_url: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +330,11 @@ class PortalNavigator:
 
         # Log available courses for debugging
         await self._log_available_courses(page)
-        raise NavigationError(f"Course link not found: {course_name}")
+        raise NavigationError(
+            f"Course link not found: {course_name}. "
+            f"The course may have been renamed or removed from this pathway. "
+            f"Check targets.json and update the course name to match the current listing."
+        )
 
     async def open_course_link(self, course_name: str) -> None:
         """Find the course link and click it, opening a new tab.
@@ -387,6 +393,13 @@ class PortalNavigator:
         """
         result = LaunchResult()
         page = self.session.page
+
+        # Step 0: Check for "Old Version" banner and follow redirect
+        new_url = await self._check_and_follow_old_version()
+        if new_url:
+            result.old_version_redirected = True
+            result.old_version_url = new_url
+            logger.info("Redirected from old version to: %s", new_url)
 
         # Step 1: Open Curriculum
         await self._wait_and_click(
@@ -865,3 +878,44 @@ class PortalNavigator:
             f"{description} button not found after {timeout_ms}ms. "
             f"Tried selectors: {selectors}"
         )
+
+    async def _check_and_follow_old_version(self) -> Optional[str]:
+        """Check if the current page shows an 'Old Version' banner.
+
+        If found, click the new-version link which reloads the page with
+        the new curriculum (same tab). The "Open Curriculum" button should
+        then appear on the reloaded page.
+
+        Returns:
+            The new version URL if a redirect was performed, or None.
+        """
+        page = self.session.page
+        banner_sel = self.selectors.get("old_version_banner")
+        link_sel = self.selectors.get("old_version_link")
+
+        if not banner_sel or not link_sel:
+            return None
+
+        try:
+            banner = page.locator(banner_sel).first
+            await banner.wait_for(state="visible", timeout=3000)
+        except Exception:
+            return None  # No old version banner — normal path
+
+        logger.warning("Old Version banner detected on course page")
+
+        try:
+            link = page.locator(link_sel).first
+            await link.wait_for(state="visible", timeout=5000)
+
+            # Click the link — page reloads in the same tab with new curriculum
+            await link.click()
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await self.session.wait_for_stable_page()
+
+            new_url = page.url
+            logger.info("Redirected to new version: %s", new_url)
+            return new_url
+        except Exception as e:
+            logger.error("Failed to follow old version redirect: %s", e)
+            return None

@@ -66,6 +66,8 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "pathway_course_table": "[id^='pathwayTable-']",
 
     # ---- Course launch sequence ----
+    "old_version_banner": 'span:has-text("Old Version")',
+    "old_version_link": 'a[href*="lms-learning-details"]',
     "open_curriculum_button": (
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Open Curriculum")'
     ),

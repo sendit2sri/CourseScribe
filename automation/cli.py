@@ -450,6 +450,18 @@ async def _run_multi_course_loop(
                 # Launch course in the new tab
                 launch_result = await portal.launch_course()
 
+                # Track old version redirect in state
+                if launch_result.old_version_redirected:
+                    entry = courses_state._courses.get(course_name)
+                    if entry:
+                        entry.old_version_redirect = launch_result.old_version_url
+                        courses_state._sync(course_name)
+                        courses_state.save()
+                    logger.info(
+                        "Course '%s' was an old version, redirected to: %s",
+                        course_name, launch_result.old_version_url,
+                    )
+
                 # Extract curriculum sidebar before navigating into content
                 curriculum_data = None
                 try:

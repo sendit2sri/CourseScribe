@@ -28,23 +28,17 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _extract_course_code(course_name: str) -> str:
-    """Extract the course code from a course name.
+def _build_course_dir_name(course_name: str) -> str:
+    """Build a descriptive, filesystem-safe directory name from a course name.
 
-    Looks for the last whitespace-delimited token matching a pattern
-    like TR2PRDXA (6+ uppercase alphanumeric characters).
-    Falls back to a sanitized version of the full name.
+    Converts the full course name to underscored form so that both the
+    descriptive title and the course code are visible in the folder name.
+    e.g. "Transact Derivatives Administration TR2PRDXA"
+      -> "Transact_Derivatives_Administration_TR2PRDXA"
     """
-    tokens = course_name.strip().split()
-    if tokens:
-        last_token = tokens[-1]
-        if re.match(r"^[A-Z0-9]{6,}$", last_token):
-            return last_token
-
-    # Fallback: sanitize full name
     safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in course_name)
     safe = "_".join(safe.split())
-    return safe[:60]
+    return safe[:80]
 
 
 @dataclass
@@ -60,6 +54,7 @@ class CourseEntry:
     attempt_count: int = 0
     last_error: Optional[str] = None
     total_pages: int = 0
+    old_version_redirect: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -76,6 +71,8 @@ class CourseEntry:
             d["last_attempt_at"] = self.last_attempt_at
         if self.last_error:
             d["last_error"] = self.last_error
+        if self.old_version_redirect:
+            d["old_version_redirect"] = self.old_version_redirect
         return d
 
     @classmethod
@@ -90,6 +87,7 @@ class CourseEntry:
             attempt_count=d.get("attempt_count", 0),
             last_error=d.get("last_error"),
             total_pages=d.get("total_pages", 0),
+            old_version_redirect=d.get("old_version_redirect"),
         )
 
 
@@ -137,15 +135,15 @@ class CoursesStateManager:
 
         for course_name in targets.pending_courses:
             if course_name not in self._courses:
-                code = _extract_course_code(course_name)
+                dir_name = _build_course_dir_name(course_name)
                 entry = CourseEntry(
                     name=course_name,
                     status=COURSE_PENDING,
-                    output_dir=code,
+                    output_dir=dir_name,
                 )
                 self._courses[course_name] = entry
                 self._state["courses"][course_name] = entry.to_dict()
-                logger.info("Added course: %s -> %s/", course_name, code)
+                logger.info("Added course: %s -> %s/", course_name, dir_name)
 
     def get_pending_courses(self) -> List[str]:
         """Return course names not yet completed (pending, in_progress, or failed)."""
@@ -196,7 +194,7 @@ class CoursesStateManager:
         entry = self._courses.get(course_name)
         if entry and entry.output_dir:
             return entry.output_dir
-        return _extract_course_code(course_name)
+        return _build_course_dir_name(course_name)
 
     def _sync(self, course_name: str) -> None:
         entry = self._courses.get(course_name)
@@ -236,6 +234,8 @@ class CoursesStateManager:
             line = f"  {status_icon} {name}"
             if entry.total_pages:
                 line += f" ({entry.total_pages} pages)"
+            if entry.old_version_redirect:
+                line += " [redirected -> new version]"
             if entry.last_error:
                 line += f" -- {entry.last_error}"
             lines.append(line)
