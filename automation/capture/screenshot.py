@@ -61,6 +61,10 @@ class ScreenshotCapture:
     def content_page(self) -> Union[Frame, Page]:
         """Return the content frame if set, otherwise the session page."""
         if self._content_frame is not None:
+            if isinstance(self._content_frame, Frame) and self._content_frame.is_detached():
+                logger.warning("Content frame is detached, falling back to page")
+                self._content_frame = None
+                return self.session.page
             return self._content_frame
         return self.session.page
 
