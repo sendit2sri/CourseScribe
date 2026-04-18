@@ -426,10 +426,19 @@ async def _run_multi_course_loop(
         # Save portal page reference for tab management
         session.save_as_portal_page()
 
-        pending = courses_state.get_pending_courses()
+        pending = courses_state.get_pending_course_targets()
+        targets_by_name = {t.name: t for t in targets.pending_courses}
         print(f"\n{len(pending)} course(s) to process\n")
 
-        for course_name in pending:
+        for course_target in pending:
+            course_name = course_target.name
+            course_code = course_target.code
+            source_target = targets_by_name.get(course_name)
+            course_url = source_target.url if source_target else ""
+            needs_manual_enrollment = (
+                source_target.needs_manual_enrollment if source_target else False
+            )
+
             if _shutdown_requested:
                 logger.info("Shutdown requested, stopping after current course")
                 break
@@ -438,6 +447,17 @@ async def _run_multi_course_loop(
             print(f"Starting: {course_name}")
             print(f"{'=' * 60}\n")
 
+            if needs_manual_enrollment:
+                msg = (
+                    "Marked needs_manual_enrollment in targets.json — "
+                    "user is not enrolled in the new version. Skipping."
+                )
+                print(f"  [SKIP] {course_name} -- {msg}")
+                logger.warning("Skipping %s: %s", course_name, msg)
+                courses_state.mark_failed(course_name, msg, "needs_manual_enrollment")
+                courses_state.save()
+                continue
+
             course_dir_name = courses_state.course_output_dir(course_name)
             full_course_dir = config.output_dir / course_dir_name
             courses_state.mark_in_progress(course_name, course_dir_name)
@@ -445,7 +465,10 @@ async def _run_multi_course_loop(
 
             try:
                 # Find and open course link (opens new tab)
-                await portal.open_course_link(course_name)
+                if course_url:
+                    await portal.open_course_url(course_url)
+                else:
+                    await portal.open_course_link(course_name, course_code=course_code)
 
                 # Launch course in the new tab
                 launch_result = await portal.launch_course()

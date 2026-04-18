@@ -69,7 +69,8 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "old_version_banner": 'span:has-text("Old Version")',
     "old_version_link": 'a[href*="lms-learning-details"]',
     "open_curriculum_button": (
-        'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Open Curriculum")'
+        'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Open Curriculum"),'
+        'button:has-text("Open Curriculum")'
     ),
     "launch_button": (
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Launch")'

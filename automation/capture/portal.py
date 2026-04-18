@@ -285,11 +285,15 @@ class PortalNavigator:
     # Step 4 & 5: Find and open course link
     # ------------------------------------------------------------------
 
-    async def find_course_link(self, course_name: str) -> Locator:
-        """Return a Locator for the course link matching the given name.
+    async def find_course_link(self, course_name: str, course_code: str = "") -> Locator:
+        """Return a Locator for the course link matching the given name or code.
 
-        Searches within pathway course tables by the link's title attribute.
-        Does NOT click.
+        Search order per table:
+          1. Name match via title attribute
+          2. Name match via link text
+          3. Code match via title attribute
+          4. Code match via link text
+          5. Code match via row/card text -> nearest anchor
 
         Raises:
             NavigationError: If the course link is not found.
@@ -298,7 +302,6 @@ class PortalNavigator:
         table_sel = self.selectors.get("pathway_course_table")
 
         if table_sel:
-            # Search for <a> tags within pathway tables
             tables = page.locator(table_sel)
             count = await tables.count()
             for i in range(count):
@@ -306,13 +309,13 @@ class PortalNavigator:
                 if not await table.is_visible():
                     continue
 
-                # Find link by title attribute
+                # 1. Name match via title attribute
                 link = table.locator(f'a[title*="{course_name}"]')
                 if await link.count() > 0:
                     logger.info("Found course link: %s", course_name)
                     return link.first
 
-                # Fallback: search by link text
+                # 2. Name match via link text
                 links = table.locator("a")
                 link_count = await links.count()
                 for j in range(link_count):
@@ -322,31 +325,71 @@ class PortalNavigator:
                         logger.info("Found course link by text: %s", course_name)
                         return a
 
+                # 3-5. Code-based fallbacks
+                if course_code:
+                    # 3. Code in title attribute
+                    link = table.locator(f'a[title*="{course_code}"]')
+                    if await link.count() > 0:
+                        logger.info("Found course link by code in title: %s", course_code)
+                        return link.first
+
+                    # 4. Code in link text
+                    link = table.locator(f'a:has-text("{course_code}")')
+                    if await link.count() > 0:
+                        logger.info("Found course link by code in text: %s", course_code)
+                        return link.first
+
+                    # 5. Code anywhere in row/card -> nearest anchor
+                    row = table.locator(f'tr:has-text("{course_code}"), [class*="card"]:has-text("{course_code}")')
+                    if await row.count() > 0:
+                        row_link = row.first.locator("a").first
+                        if await row_link.count() > 0:
+                            logger.info("Found course link by code in row: %s", course_code)
+                            return row_link
+
         # Broader fallback: search entire page
         link = page.locator(f'a[title*="{course_name}"]')
         if await link.count() > 0:
             logger.info("Found course link (broad search): %s", course_name)
             return link.first
 
+        if course_code:
+            link = page.locator(f'a[title*="{course_code}"]')
+            if await link.count() > 0:
+                logger.info("Found course link by code (broad): %s", course_code)
+                return link.first
+
+            link = page.locator(f'a:has-text("{course_code}")')
+            if await link.count() > 0:
+                logger.info("Found course link by code text (broad): %s", course_code)
+                return link.first
+
         # Log available courses for debugging
         await self._log_available_courses(page)
+        code_info = f" (code: {course_code})" if course_code else ""
         raise NavigationError(
-            f"Course link not found: {course_name}. "
+            f"Course link not found: {course_name}{code_info}. "
             f"The course may have been renamed or removed from this pathway. "
             f"Check targets.json and update the course name to match the current listing."
         )
 
-    async def open_course_link(self, course_name: str) -> None:
+    async def open_course_link(self, course_name: str, course_code: str = "") -> None:
         """Find the course link and click it, opening a new tab.
 
         The caller should use session.click_and_wait_for_new_tab() to
         capture the new tab.  This method just finds the link and triggers
         the click inside the new-tab expectation.
         """
-        link = await self.find_course_link(course_name)
+        link = await self.find_course_link(course_name, course_code=course_code)
 
         # Scroll into view — course links in pathway tables may be outside viewport
-        await link.scroll_into_view_if_needed()
+        try:
+            await link.scroll_into_view_if_needed()
+        except Exception:
+            logger.warning("Scroll failed for %s, re-finding link", course_name)
+            await asyncio.sleep(1)
+            link = await self.find_course_link(course_name, course_code=course_code)
+            await link.scroll_into_view_if_needed()
         await asyncio.sleep(0.5)
 
         async def _click():
@@ -354,6 +397,20 @@ class PortalNavigator:
 
         await self.session.click_and_wait_for_new_tab(_click)
         logger.info("Opened course in new tab: %s", course_name)
+
+    async def open_course_url(self, url: str) -> None:
+        """Open a course directly via URL in a new tab, bypassing pathway lookup.
+
+        Used when targets.json provides an explicit `url` for a course (e.g. when
+        the pathway page hides or lazy-loads the course link).
+        """
+        page = self.session.page
+
+        async def _open():
+            await page.evaluate("(u) => window.open(u, '_blank')", url)
+
+        await self.session.click_and_wait_for_new_tab(_open)
+        logger.info("Opened course in new tab via direct URL: %s", url)
 
     async def _log_available_courses(self, page: Page) -> None:
         """Log available course links for debugging when a course is not found."""
@@ -405,7 +462,7 @@ class PortalNavigator:
         await self._wait_and_click(
             self.selectors.get("open_curriculum_button"),
             "Open Curriculum",
-            timeout_ms=30000,
+            timeout_ms=60000,
         )
 
         # Step 2: Launch

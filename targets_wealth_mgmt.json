@@ -1,0 +1,17 @@
+{
+  "targets": [
+    {
+      "category": "Transact - Core Banking",
+      "pathway_name": "Temenos Transact Business Wealth Management Practitioner",
+      "pending_courses": [
+        {
+          "name": "Transact Derivatives Trading and Management TR2PRDXT",
+          "code": "TR2PRDXT"
+        }
+      ],
+      "skip_titles": [
+        "Course Document"
+      ]
+    }
+  ]
+}

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from automation.config import TargetsConfig
+from automation.config import CourseTarget, TargetsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,22 @@ COURSE_FAILED = "failed"
 def _now() -> str:
     """ISO format timestamp."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def classify_failure(error: str) -> str:
+    """Classify a failure error string into a failure type."""
+    lower = error.lower()
+    if "course link not found" in lower:
+        return "course_link_not_found"
+    if "open curriculum" in lower and ("not found" in lower or "button" in lower):
+        return "open_curriculum_missing"
+    if "scroll_into_view" in lower or "element is not visible" in lower or (
+        "timeout" in lower and ("scroll" in lower or "view" in lower)
+    ):
+        return "visibility_or_scroll_timeout"
+    if "old version" in lower or "redirected" in lower:
+        return "redirected_version"
+    return "unknown"
 
 
 def _build_course_dir_name(course_name: str) -> str:
@@ -46,6 +62,8 @@ class CourseEntry:
     """State of a single course in the multi-course pipeline."""
 
     name: str
+    course_code: str = ""
+    pathway_name: str = ""
     status: str = COURSE_PENDING
     output_dir: str = ""
     started_at: Optional[str] = None
@@ -53,6 +71,7 @@ class CourseEntry:
     last_attempt_at: Optional[str] = None
     attempt_count: int = 0
     last_error: Optional[str] = None
+    failure_type: Optional[str] = None
     total_pages: int = 0
     old_version_redirect: Optional[str] = None
 
@@ -63,6 +82,10 @@ class CourseEntry:
             "attempt_count": self.attempt_count,
             "total_pages": self.total_pages,
         }
+        if self.course_code:
+            d["course_code"] = self.course_code
+        if self.pathway_name:
+            d["pathway_name"] = self.pathway_name
         if self.started_at:
             d["started_at"] = self.started_at
         if self.completed_at:
@@ -71,6 +94,8 @@ class CourseEntry:
             d["last_attempt_at"] = self.last_attempt_at
         if self.last_error:
             d["last_error"] = self.last_error
+        if self.failure_type:
+            d["failure_type"] = self.failure_type
         if self.old_version_redirect:
             d["old_version_redirect"] = self.old_version_redirect
         return d
@@ -79,6 +104,8 @@ class CourseEntry:
     def from_dict(cls, name: str, d: Dict[str, Any]) -> "CourseEntry":
         return cls(
             name=name,
+            course_code=d.get("course_code", ""),
+            pathway_name=d.get("pathway_name", ""),
             status=d.get("status", COURSE_PENDING),
             output_dir=d.get("output_dir", ""),
             started_at=d.get("started_at"),
@@ -86,6 +113,7 @@ class CourseEntry:
             last_attempt_at=d.get("last_attempt_at"),
             attempt_count=d.get("attempt_count", 0),
             last_error=d.get("last_error"),
+            failure_type=d.get("failure_type"),
             total_pages=d.get("total_pages", 0),
             old_version_redirect=d.get("old_version_redirect"),
         )
@@ -130,25 +158,44 @@ class CoursesStateManager:
         """Populate course entries from targets.json.
 
         Idempotent: only adds courses not already present (for resume).
+        Backfills course_code and pathway_name on existing entries.
         """
         self._state["pathway_name"] = targets.pathway_name
 
-        for course_name in targets.pending_courses:
-            if course_name not in self._courses:
-                dir_name = _build_course_dir_name(course_name)
+        for course_target in targets.pending_courses:
+            if course_target.name not in self._courses:
+                dir_name = _build_course_dir_name(course_target.name)
                 entry = CourseEntry(
-                    name=course_name,
+                    name=course_target.name,
+                    course_code=course_target.code,
+                    pathway_name=targets.pathway_name,
                     status=COURSE_PENDING,
                     output_dir=dir_name,
                 )
-                self._courses[course_name] = entry
-                self._state["courses"][course_name] = entry.to_dict()
-                logger.info("Added course: %s -> %s/", course_name, dir_name)
+                self._courses[course_target.name] = entry
+                self._state["courses"][course_target.name] = entry.to_dict()
+                logger.info("Added course: %s -> %s/", course_target.name, dir_name)
+            else:
+                # Backfill code and pathway on existing entries
+                entry = self._courses[course_target.name]
+                if not entry.course_code and course_target.code:
+                    entry.course_code = course_target.code
+                if not entry.pathway_name:
+                    entry.pathway_name = targets.pathway_name
+                self._sync(course_target.name)
 
     def get_pending_courses(self) -> List[str]:
         """Return course names not yet completed (pending, in_progress, or failed)."""
         return [
             name
+            for name, entry in self._courses.items()
+            if entry.status in (COURSE_PENDING, COURSE_IN_PROGRESS, COURSE_FAILED)
+        ]
+
+    def get_pending_course_targets(self) -> List[CourseTarget]:
+        """Return CourseTarget objects for courses not yet completed."""
+        return [
+            CourseTarget(name=name, code=entry.course_code)
             for name, entry in self._courses.items()
             if entry.status in (COURSE_PENDING, COURSE_IN_PROGRESS, COURSE_FAILED)
         ]
@@ -180,12 +227,13 @@ class CoursesStateManager:
         entry.last_error = None
         self._sync(course_name)
 
-    def mark_failed(self, course_name: str, error: str) -> None:
+    def mark_failed(self, course_name: str, error: str, failure_type: Optional[str] = None) -> None:
         entry = self._courses.get(course_name)
         if not entry:
             return
         entry.status = COURSE_FAILED
         entry.last_error = error
+        entry.failure_type = failure_type or classify_failure(error)
         entry.last_attempt_at = _now()
         self._sync(course_name)
 
