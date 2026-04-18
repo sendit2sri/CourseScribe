@@ -426,18 +426,23 @@ async def _run_multi_course_loop(
         # Save portal page reference for tab management
         session.save_as_portal_page()
 
-        pending = courses_state.get_pending_course_targets()
-        targets_by_name = {t.name: t for t in targets.pending_courses}
+        pending = [
+            t for t in targets.pending_courses
+            if not courses_state.is_course_complete(t.name)
+        ]
+        completed_skipped = [
+            t.name for t in targets.pending_courses
+            if courses_state.is_course_complete(t.name)
+        ]
+        for name in completed_skipped:
+            print(f"  [SKIP] {name} -- already completed")
         print(f"\n{len(pending)} course(s) to process\n")
 
         for course_target in pending:
             course_name = course_target.name
             course_code = course_target.code
-            source_target = targets_by_name.get(course_name)
-            course_url = source_target.url if source_target else ""
-            needs_manual_enrollment = (
-                source_target.needs_manual_enrollment if source_target else False
-            )
+            course_url = course_target.url
+            needs_manual_enrollment = course_target.needs_manual_enrollment
 
             if _shutdown_requested:
                 logger.info("Shutdown requested, stopping after current course")

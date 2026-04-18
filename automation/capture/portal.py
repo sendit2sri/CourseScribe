@@ -965,9 +965,23 @@ class PortalNavigator:
             link = page.locator(link_sel).first
             await link.wait_for(state="visible", timeout=5000)
 
-            # Click the link — page reloads in the same tab with new curriculum
+            old_url = page.url
             await link.click()
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+
+            # The "here" link navigates same-tab to the new Curriculum route.
+            # Wait for the URL to actually change, then let the shell settle,
+            # so launch_course()'s next step ("Open Curriculum") finds a
+            # hydrated page.
+            try:
+                await page.wait_for_url(
+                    lambda u: u != old_url and "/Curriculum/" in u,
+                    timeout=15000,
+                )
+            except Exception:
+                await page.wait_for_load_state(
+                    "domcontentloaded", timeout=30000
+                )
+
             await self.session.wait_for_stable_page()
 
             new_url = page.url

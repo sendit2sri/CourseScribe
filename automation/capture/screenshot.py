@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-from playwright.async_api import Frame, Page
+from playwright.async_api import Frame, Page, TimeoutError as PlaywrightTimeoutError
 
 from automation.capture.browser import BrowserSession
 from automation.capture.cropper import ContentCropper
@@ -137,13 +137,23 @@ class ScreenshotCapture:
             try:
                 iframe_el = await page.query_selector(iframe_sel)
                 if iframe_el:
-                    # Scroll iframe content to top before capture
+                    # Scroll iframe content to top before capture. Retry once
+                    # if the player re-renders and destroys the context.
                     try:
                         await self._content_frame.evaluate(
                             "window.scrollTo(0, 0)"
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if "Execution context was destroyed" in str(e):
+                            try:
+                                await self._content_frame.wait_for_load_state(
+                                    "domcontentloaded", timeout=5000
+                                )
+                                await self._content_frame.evaluate(
+                                    "window.scrollTo(0, 0)"
+                                )
+                            except Exception:
+                                pass
                     await iframe_el.screenshot(path=str(output_path))
                     logger.info(f"Content-frame screenshot: {output_path.name}")
                     return output_path
@@ -152,7 +162,17 @@ class ScreenshotCapture:
                     f"Iframe screenshot failed, falling back to full page: {e}"
                 )
 
-        await page.screenshot(path=str(output_path), full_page=True)
+        try:
+            await page.screenshot(
+                path=str(output_path), full_page=True, timeout=15000
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                "Screenshot timed out; retrying once with viewport-only capture"
+            )
+            await page.screenshot(
+                path=str(output_path), full_page=False, timeout=10000
+            )
         logger.info(f"Full-page screenshot: {output_path.name}")
         return output_path
 

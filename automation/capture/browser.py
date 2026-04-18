@@ -163,6 +163,16 @@ class BrowserSession:
         # Inject stealth scripts before any page JS runs
         await self._context.add_init_script(script=_STEALTH_JS)
 
+        # Abort Google Fonts CDN requests so document.fonts.ready resolves
+        # quickly — otherwise page.screenshot() can time out waiting for fonts
+        # that never load. display=swap ensures text still renders with
+        # system fallback fonts, and portal icon-fonts are served locally.
+        async def _abort_font_cdn(route):
+            await route.abort()
+
+        await self._context.route("**/fonts.googleapis.com/**", _abort_font_cdn)
+        await self._context.route("**/fonts.gstatic.com/**", _abort_font_cdn)
+
         # Use the first page or create one
         if self._context.pages:
             self._page = self._context.pages[0]
@@ -770,11 +780,38 @@ class BrowserSession:
             except Exception:
                 pass  # Indicator not found — fall through
 
+    async def _safe_evaluate(self, expression: str, *args, retries: int = 1):
+        """page.evaluate with one retry when the execution context is destroyed
+        by a concurrent navigation (e.g. Cornerstone player re-render).
+        """
+        for attempt in range(retries + 1):
+            try:
+                if args:
+                    return await self._page.evaluate(expression, *args)
+                return await self._page.evaluate(expression)
+            except Exception as e:
+                msg = str(e)
+                transient = (
+                    "Execution context was destroyed" in msg
+                    or "Target closed" in msg
+                    or "context destroyed" in msg.lower()
+                )
+                if attempt < retries and transient:
+                    logger.debug("evaluate() hit navigation race, retrying: %s", msg)
+                    try:
+                        await self._page.wait_for_load_state(
+                            "domcontentloaded", timeout=10000
+                        )
+                    except Exception:
+                        pass
+                    continue
+                raise
+
     async def get_page_height(self) -> int:
         """Get the full scrollable height of the page."""
         if not self._page:
             return 0
-        return await self._page.evaluate(
+        return await self._safe_evaluate(
             "() => document.documentElement.scrollHeight"
         )
 
@@ -782,12 +819,12 @@ class BrowserSession:
         """Get the viewport height."""
         if not self._page:
             return 0
-        return await self._page.evaluate("() => window.innerHeight")
+        return await self._safe_evaluate("() => window.innerHeight")
 
     async def scroll_to(self, y: int) -> None:
         """Scroll to a specific Y position."""
         if self._page:
-            await self._page.evaluate(f"window.scrollTo(0, {y})")
+            await self._safe_evaluate(f"window.scrollTo(0, {y})")
             await asyncio.sleep(0.3)  # brief pause for render
 
     async def get_current_url(self) -> str:
