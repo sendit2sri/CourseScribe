@@ -1,72 +1,119 @@
-# 1. Install
+# CourseScribe Usage
+
+## 1. Install
+
+```bash
 pip install -r requirements.txt && playwright install chromium
+```
 
-# 2. Configure
-cp .env.example .env       # fill in credentials and login URL
-cp targets.json.example targets.json  # fill in course names
+## 2. Configure
 
-# 3. Login (saves persistent session)
+```bash
+cp .env.example .env                     # fill in credentials and login URL
+cp targets.json.example targets.json     # fill in course names
+```
 
-python -m automation login
+## 3. Extract targets from catalog (optional)
 
-# 4. Run all courses
-python -m automation run-all --targets-file targets.json
-
-# 5. Resume after interruption (just re-run)
-python -m automation run-all --targets-file targets.json
-
-# 6. Check status
-python -m automation status --output-dir course_capture/TR2PRDXA
-
-
+```bash
+# Export full catalog to JSON
 python extract_courses.py catalog.html --pretty --output courses.json
 
-python extract_courses.py catalog.html --category "Core Banking" --pathway "Transact Business Accredited" --make-targets --pretty -o targets.json
+# Generate targets.json for a specific pathway
+python extract_courses.py catalog.html \
+  --category "Core Banking" \
+  --pathway "Transact Business Accredited" \
+  --make-targets --pretty -o targets.json
+```
 
+## 4. Login (saves persistent browser session)
+
+```bash
 python -m automation login
+```
 
+## 5. Run all courses (Accredited pathway)
+
+```bash
+# Default pacing (3s page delay, breaks every 15-30 pages)
+python -m automation run-all --targets-file targets.json
+
+# Faster but still human-looking (~5-6s/page effective)
+python -m automation run-all --targets-file targets.json \
+  --page-delay 2 --idle-pause-interval 25-40 --idle-pause-duration 30-90
+
+# Custom pacing: breaks every 10-20 pages, 1-3 min each
+python -m automation run-all --targets-file targets.json \
+  --idle-pause-interval 10-20 --idle-pause-duration 60-180
+
+# With OpenCV content cropping enabled
 python -m automation run-all --targets-file targets.json --enable-crops
 
---enable-crops
+# Fastest (no reading breaks, higher bot-detection risk)
+python -m automation run-all --targets-file targets.json \
+  --page-delay 1 --idle-pause-interval 0
+```
 
-  - Log output shows filter messages (use --log-level DEBUG)  
+## 6. Run Wealth Management pathway (separate targets)
 
-python -m automation process --output-dir <path-to-course-output>   
+```bash
+python -m automation run-all --targets-file targets_wealth_mgmt.json
+```
 
-  Usage examples:                                                                 
-  # Default: 3s page delay, reading breaks every 15-30 pages (2-5 min each), no   
-  batch limit                                                                     
-  python -m automation run --start-url URL                                        
-                                                                                  
-  # Batch of 40 pages, then exit (code 2). Resume picks up from checkpoint.       
-  python -m automation run --start-url URL --batch-size 40                        
-                                                                                  
-  # Custom pacing: breaks every 10-20 pages, 1-3 min each                         
-  python -m automation run --start-url URL --idle-pause-interval 10-20 --idle-pause-duration 60-180  
+## 7. Resume after interruption
 
-  python -m automation run-all --targets-file targets.json --idle-pause-interval 10-20 --idle-pause-duration 60-180                      
-                                                                                  
-  # Disable reading breaks entirely                         
-  python -m automation run --start-url URL --idle-pause-interval 0 
+```bash
+# Just re-run the same command -- completed pages are skipped automatically
+python -m automation run-all --targets-file targets.json
+```
 
-  Faster but still human-looking:
+## 8. Retry failed courses
 
+```bash
+# Re-run the same command -- failed courses listed in the targets file are
+# retried, completed ones are skipped (with a [SKIP] line printed).
+python -m automation run-all --targets-file targets.json
 
-python -m automation run-all --targets-file targets.json --page-delay 2 --idle-pause-interval 25-40 --idle-pause-duration 30-90
+# Check which courses failed and why before retrying
+python -m automation status --output-dir course_capture
+```
 
-python -m automation run-all --targets-file targets.json --page-delay 2 --idle-pause-interval 25-40 --idle-pause-duration 30-90
+Only courses listed in `--targets-file` are processed in a run. Failed/in-progress
+entries from unrelated past runs stay in `courses_state.json` but are not picked
+up automatically — add them back to a targets file to retry.
 
-This gives:
+## 9. Check status
 
-2s page delay (1.4-3s with jitter) — still realistic
-Breaks of 30-90s every 25-40 pages — less frequent, shorter
-~5-6s/page effective
-That's roughly 3-4x faster. If you have ~500 pages total, that's ~45 min vs ~3 hours.
+```bash
+# Overall pathway status
+python -m automation status --output-dir course_capture
 
-If you want even faster and are comfortable with the risk:
+# Single course status
+python -m automation status --output-dir course_capture/Transact_Derivatives_Administration_TR2PRDXA
+```
 
+## 10. OCR-only processing (on existing screenshots)
 
-python -m automation run-all --targets-file targets.json --page-delay 1 --idle-pause-interval 0
+```bash
+python -m automation process --output-dir <path-to-course-output>
+```
 
-  python -m automation run-all --targets-file
-  targets_wealth_mgmt.json   
+## 11. Single course run (by URL)
+
+```bash
+# Default pacing
+python -m automation run --start-url URL
+
+# Batch of 40 pages, then exit (resume picks up from checkpoint)
+python -m automation run --start-url URL --batch-size 40
+
+# No reading breaks
+python -m automation run --start-url URL --idle-pause-interval 0
+```
+
+## 12. Debugging
+
+```bash
+# Verbose logging
+python -m automation run-all --targets-file targets.json --log-level DEBUG
+```
