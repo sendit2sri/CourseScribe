@@ -53,6 +53,9 @@ python -m automation process --output-dir <path-to-course-output>
 
 
 python -m automation run-all --targets-file targets.json --page-delay 2 --idle-pause-interval 25-40 --idle-pause-duration 30-90
+
+python -m automation run-all --targets-file targets.json --page-delay 2 --idle-pause-interval 25-40 --idle-pause-duration 30-90
+
 This gives:
 
 2s page delay (1.4-3s with jitter) — still realistic
@@ -64,3 +67,6 @@ If you want even faster and are comfortable with the risk:
 
 
 python -m automation run-all --targets-file targets.json --page-delay 1 --idle-pause-interval 0
+
+  python -m automation run-all --targets-file
+  targets_wealth_mgmt.json   

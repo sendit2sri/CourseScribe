@@ -18,11 +18,21 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 @dataclass
+class CourseTarget:
+    """A single course entry from targets.json."""
+
+    name: str
+    code: str = ""
+    url: str = ""
+    needs_manual_enrollment: bool = False
+
+
+@dataclass
 class TargetsConfig:
     """Parsed contents of targets.json."""
 
     pathway_name: str
-    pending_courses: List[str]
+    pending_courses: List[CourseTarget]
     category: str = ""
     skip_titles: List[str] = field(default_factory=lambda: ["Course Document"])
 
@@ -253,15 +263,34 @@ class AutomationConfig:
             category = entry.get("category", "")
             pathway_name = entry.get("pathway_name", "")
             raw_courses = entry.get("pending_courses", [])
-            # Handle course objects with "name" key or plain strings
+            # Handle course objects with "name"+"code" keys or plain strings
             pending_courses = [
-                c["name"] if isinstance(c, dict) else c for c in raw_courses
+                CourseTarget(
+                    name=c["name"],
+                    code=c.get("code", ""),
+                    url=c.get("url", ""),
+                    needs_manual_enrollment=c.get("needs_manual_enrollment", False),
+                )
+                if isinstance(c, dict)
+                else CourseTarget(name=c)
+                for c in raw_courses
             ]
             skip_titles = entry.get("skip_titles", ["Course Document"])
         else:
             category = data.get("category", "")
             pathway_name = data.get("pathway_name", "")
-            pending_courses = data.get("pending_courses", [])
+            raw = data.get("pending_courses", [])
+            pending_courses = [
+                CourseTarget(
+                    name=c["name"],
+                    code=c.get("code", ""),
+                    url=c.get("url", ""),
+                    needs_manual_enrollment=c.get("needs_manual_enrollment", False),
+                )
+                if isinstance(c, dict)
+                else CourseTarget(name=c)
+                for c in raw
+            ]
             skip_titles = data.get("skip_titles", ["Course Document"])
 
         if not pathway_name:
@@ -269,6 +298,14 @@ class AutomationConfig:
 
         if not pending_courses:
             raise ValueError(f"Missing or empty 'pending_courses' in {targets_path}")
+
+        # Warn on duplicate course codes
+        codes = [c.code for c in pending_courses if c.code]
+        seen = set()
+        for code in codes:
+            if code in seen:
+                logger.warning("Duplicate course code in targets: %s", code)
+            seen.add(code)
 
         logger.info(
             "Loaded targets: pathway=%s, courses=%d, skip_titles=%s",
