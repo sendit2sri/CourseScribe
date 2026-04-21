@@ -90,6 +90,7 @@ class PortalNavigator:
         for selector in self.selectors.get_chain("pathway_tab_prefix"):
             if await page.locator(selector).count() > 0:
                 logger.info("Already on Pathways page (category tabs detected), skipping navigation")
+                self.session.pathways_landing_url = page.url
                 return
 
         # Portal widgets render dynamically — retry for up to ~10 seconds
@@ -99,6 +100,7 @@ class PortalNavigator:
                 locator = page.locator(selector)
                 if await locator.count() > 0:
                     await self._click_pathways_link(locator.first)
+                    self.session.pathways_landing_url = self.session.page.url
                     return
 
             # Fallback: find all "Pathways" text matches, click first visible one
@@ -108,12 +110,27 @@ class PortalNavigator:
                 el = pathways_all.nth(i)
                 if await el.is_visible():
                     await self._click_pathways_link(el)
+                    self.session.pathways_landing_url = self.session.page.url
                     return
 
             logger.debug("Pathways box not yet visible (attempt %d/10)", attempt + 1)
             await asyncio.sleep(1)
 
         raise NavigationError("Pathways box not found on the portal page")
+
+    async def return_to_pathways_landing(self) -> None:
+        """Navigate the portal page back to the cached Pathways landing URL.
+
+        Used between pathways in a multi-pathway run-all. Falls back to
+        full navigate_to_pathways() if no URL was cached.
+        """
+        url = getattr(self.session, "pathways_landing_url", None)
+        if url:
+            logger.info("Returning to pathways landing: %s", url)
+            await self.session.page.goto(url)
+            await self.session.wait_for_stable_page()
+            return
+        await self.navigate_to_pathways()
 
     async def _click_pathways_link(self, locator: Locator) -> None:
         """Click the Pathways element, handling new-tab or same-page navigation."""
