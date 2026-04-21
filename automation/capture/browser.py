@@ -136,6 +136,7 @@ class BrowserSession:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._portal_page: Optional[Page] = None
+        self.pathways_landing_url: Optional[str] = None
 
     async def start(self) -> "BrowserSession":
         """Launch a persistent browser context. Reuses existing profile."""
