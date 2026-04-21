@@ -364,6 +364,26 @@ class PortalNavigator:
                 logger.info("Found course link by code text (broad): %s", course_code)
                 return link.first
 
+            # Pathway tables sometimes lazy-render entries below the fold —
+            # scroll and rescan once before giving up.
+            try:
+                await page.mouse.wheel(0, 3000)
+                await asyncio.sleep(1)
+                code_link = page.locator(
+                    f'a[title*="{course_code}"], a:has-text("{course_code}")'
+                ).first
+                if (
+                    await code_link.count() > 0
+                    and await code_link.is_visible()
+                ):
+                    logger.info(
+                        "Found course link after scroll by course code: %s",
+                        course_code,
+                    )
+                    return code_link
+            except Exception:
+                pass
+
         # Log available courses for debugging
         await self._log_available_courses(page)
         code_info = f" (code: {course_code})" if course_code else ""
@@ -379,8 +399,28 @@ class PortalNavigator:
         The caller should use session.click_and_wait_for_new_tab() to
         capture the new tab.  This method just finds the link and triggers
         the click inside the new-tab expectation.
+
+        If the course isn't listed on the current pathway page, falls back
+        to the portal's global search (when a course_code is provided).
         """
-        link = await self.find_course_link(course_name, course_code=course_code)
+        try:
+            link = await self.find_course_link(course_name, course_code=course_code)
+        except NavigationError as pathway_error:
+            if not course_code:
+                raise
+            logger.warning(
+                "Course not found on pathway page; attempting global search fallback for %s",
+                course_code,
+            )
+            try:
+                await self.open_course_via_global_search(course_code)
+                return
+            except Exception as search_error:
+                raise NavigationError(
+                    f"Failed to open course '{course_name}' ({course_code}) via "
+                    f"pathway lookup and global search. Pathway error: "
+                    f"{pathway_error}. Global search error: {search_error}"
+                ) from search_error
 
         # Scroll into view — course links in pathway tables may be outside viewport
         try:
@@ -397,6 +437,92 @@ class PortalNavigator:
 
         await self.session.click_and_wait_for_new_tab(_click)
         logger.info("Opened course in new tab: %s", course_name)
+
+    # ------------------------------------------------------------------
+    # Global search fallback
+    # ------------------------------------------------------------------
+
+    async def find_via_global_search(self, course_code: str) -> Locator:
+        """Locate a course via the portal's global search by course code.
+
+        Returns:
+            A Locator pointing at the search-result link for the course.
+
+        Raises:
+            NavigationError: If no search UI is present or no result matches.
+        """
+        page = self.session.page
+
+        trigger_sel = self.selectors.get("global_search_trigger")
+        input_sel = self.selectors.get("global_search_input")
+        result_sel = self.selectors.get("global_search_result_link")
+
+        if not trigger_sel or not result_sel:
+            raise NavigationError("Global search selectors not configured")
+
+        trigger = page.locator(trigger_sel).first
+        if await trigger.count() == 0:
+            raise NavigationError("Global search trigger not found on portal")
+
+        tag_name = (
+            await trigger.evaluate("(el) => el.tagName")
+        ).upper()
+
+        if tag_name == "INPUT":
+            search_input = trigger
+            try:
+                await search_input.focus()
+            except Exception:
+                await search_input.click()
+        else:
+            await trigger.click()
+            if not input_sel:
+                raise NavigationError("Global search input selector missing")
+            search_input = page.locator(input_sel).first
+            await search_input.wait_for(state="visible", timeout=10000)
+
+        await search_input.fill(course_code)
+        await search_input.press("Enter")
+
+        result = page.locator(result_sel).first
+        await result.wait_for(state="visible", timeout=15000)
+
+        # Scope each branch of the result-link chain with a title= or
+        # :has-text() filter so we don't accidentally click the wrong result.
+        result_branches = self.selectors.get_chain("global_search_result_link")
+        by_title = ",".join(
+            f'{branch}[title*="{course_code}"]' for branch in result_branches
+        )
+        if by_title:
+            scoped = page.locator(by_title).first
+            if await scoped.count() > 0:
+                return scoped
+
+        by_text = ",".join(
+            f'{branch}:has-text("{course_code}")' for branch in result_branches
+        )
+        if by_text:
+            scoped = page.locator(by_text).first
+            if await scoped.count() > 0:
+                return scoped
+
+        raise NavigationError(
+            f"Global search returned results but none matched code '{course_code}'"
+        )
+
+    async def open_course_via_global_search(self, course_code: str) -> None:
+        """Find a course via global search and click it, opening a new tab."""
+        result = await self.find_via_global_search(course_code)
+        try:
+            await result.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        async def _click():
+            await result.click()
+
+        await self.session.click_and_wait_for_new_tab(_click)
+        logger.info("Opened course via global search: %s", course_code)
 
     async def open_course_url(self, url: str) -> None:
         """Open a course directly via URL in a new tab, bypassing pathway lookup.
@@ -451,26 +577,41 @@ class PortalNavigator:
         result = LaunchResult()
         page = self.session.page
 
-        # Step 0: Check for "Old Version" banner and follow redirect
-        new_url = await self._check_and_follow_old_version()
-        if new_url:
-            result.old_version_redirected = True
-            result.old_version_url = new_url
-            logger.info("Redirected from old version to: %s", new_url)
+        # Track whether any old-version CTA was followed during the run.
+        self._old_version_followed_during_launch = False
+        self._old_version_followed_url = ""
+        pre_launch_url = page.url
 
-        # Step 1: Open Curriculum
-        await self._wait_and_click(
+        # Step 0: Check for old-version CTA before Open Curriculum.
+        if await self._follow_old_version_if_present():
+            self._old_version_followed_during_launch = True
+            self._old_version_followed_url = page.url
+
+        # Step 1: Open Curriculum (with old-version fallback on timeout).
+        await self._click_with_old_version_fallback(
             self.selectors.get("open_curriculum_button"),
             "Open Curriculum",
             timeout_ms=60000,
         )
 
-        # Step 2: Launch
-        await self._wait_and_click(
+        # Step 1b: Some courses expose the old-version CTA only after
+        # Open Curriculum — check again before Launch.
+        if await self._follow_old_version_if_present():
+            self._old_version_followed_during_launch = True
+            self._old_version_followed_url = page.url
+
+        # Step 2: Launch (with old-version fallback on timeout).
+        await self._click_with_old_version_fallback(
             self.selectors.get("launch_button"),
             "Launch",
             timeout_ms=30000,
         )
+
+        if self._old_version_followed_during_launch:
+            result.old_version_redirected = True
+            final_url = self._old_version_followed_url or page.url
+            if final_url and final_url != pre_launch_url:
+                result.old_version_url = final_url
 
         # Step 3: Fullscreen
         result.fullscreen_succeeded = await self._wait_and_click(
@@ -936,57 +1077,99 @@ class PortalNavigator:
             f"Tried selectors: {selectors}"
         )
 
-    async def _check_and_follow_old_version(self) -> Optional[str]:
-        """Check if the current page shows an 'Old Version' banner.
-
-        If found, click the new-version link which reloads the page with
-        the new curriculum (same tab). The "Open Curriculum" button should
-        then appear on the reloaded page.
+    async def _follow_old_version_if_present(self) -> bool:
+        """Probe for an old-version "click here to access the latest version"
+        CTA and click it if visible. Idempotent and cheap — safe to call
+        multiple times during a launch sequence.
 
         Returns:
-            The new version URL if a redirect was performed, or None.
+            True if the CTA was found and clicked (regardless of whether the
+            URL visibly changed — some portals swap the DOM in place).
+            False if no CTA was visible.
         """
         page = self.session.page
-        banner_sel = self.selectors.get("old_version_banner")
         link_sel = self.selectors.get("old_version_link")
-
-        if not banner_sel or not link_sel:
-            return None
-
-        try:
-            banner = page.locator(banner_sel).first
-            await banner.wait_for(state="visible", timeout=3000)
-        except Exception:
-            return None  # No old version banner — normal path
-
-        logger.warning("Old Version banner detected on course page")
+        if not link_sel:
+            return False
 
         try:
             link = page.locator(link_sel).first
-            await link.wait_for(state="visible", timeout=5000)
+            if not await link.is_visible():
+                return False
+        except Exception:
+            return False
 
+        logger.warning("Old version link detected; redirecting to latest version")
+
+        try:
             old_url = page.url
             await link.click()
 
-            # The "here" link navigates same-tab to the new Curriculum route.
-            # Wait for the URL to actually change, then let the shell settle,
-            # so launch_course()'s next step ("Open Curriculum") finds a
-            # hydrated page.
             try:
                 await page.wait_for_url(
                     lambda u: u != old_url and "/Curriculum/" in u,
                     timeout=15000,
                 )
             except Exception:
-                await page.wait_for_load_state(
-                    "domcontentloaded", timeout=30000
-                )
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded", timeout=10000
+                    )
+                except Exception:
+                    pass
 
-            await self.session.wait_for_stable_page()
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
 
             new_url = page.url
-            logger.info("Redirected to new version: %s", new_url)
-            return new_url
+            if new_url != old_url:
+                logger.info("Redirected to new version: %s", new_url)
+            else:
+                logger.info(
+                    "Old-version CTA clicked; DOM swapped in place (URL unchanged)"
+                )
+            return True
         except Exception as e:
             logger.error("Failed to follow old version redirect: %s", e)
-            return None
+            return False
+
+    async def _click_with_old_version_fallback(
+        self,
+        selector_chain: str,
+        description: str,
+        timeout_ms: int,
+    ) -> None:
+        """Click a button; if the click times out, probe for an old-version
+        CTA that may have appeared between steps, follow it if present, and
+        retry the click once.
+        """
+        try:
+            await self._wait_and_click(selector_chain, description, timeout_ms=timeout_ms)
+            return
+        except CourseLaunchError as original_error:
+            logger.warning(
+                "%s not found within %dms; probing for old-version CTA",
+                description,
+                timeout_ms,
+            )
+            followed = await self._follow_old_version_if_present()
+            if not followed:
+                raise original_error
+
+            # Capture that a redirect happened so launch_course() can record it.
+            self._old_version_followed_during_launch = True
+            self._old_version_followed_url = self.session.page.url
+
+            page = self.session.page
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            await self._wait_and_click(selector_chain, description, timeout_ms=timeout_ms)
