@@ -66,9 +66,34 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "pathway_course_table": "[id^='pathwayTable-']",
 
     # ---- Course launch sequence ----
-    "old_version_banner": 'span:has-text("Old Version")',
+    # Kept for diagnostic logging; the helper now gates on old_version_link.
+    "old_version_banner": (
+        'p[data-testid="LD_Call_To_Action_Instructions"]:has(a[href*="lms-learning-details"]),'
+        'span:has-text("Old Version"),'
+        ':has-text("latest version"):has(a:has-text("here"))'
+    ),
     "old_version_link": (
         'p[data-testid="LD_Call_To_Action_Instructions"] a[href*="lms-learning-details"],'
+        'a[href*="lms-learning-details"]'
+    ),
+
+    # ---- Global search fallback (used when a course isn't on its pathway page) ----
+    "global_search_trigger": (
+        'button[aria-label*="Search" i],'
+        'input[type="search"],'
+        '[data-testid*="search" i] input,'
+        '#searchBox input,'
+        'input[placeholder*="Search" i]'
+    ),
+    "global_search_input": (
+        'input[type="search"],'
+        '[data-testid*="search" i] input,'
+        '#searchBox input,'
+        'input[placeholder*="Search" i]'
+    ),
+    "global_search_result_link": (
+        '[class*="search-result"] a,'
+        '[data-testid*="searchResult" i] a,'
         'a[href*="lms-learning-details"]'
     ),
     "open_curriculum_button": (
