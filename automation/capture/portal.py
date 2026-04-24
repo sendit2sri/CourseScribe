@@ -606,6 +606,12 @@ class PortalNavigator:
 
         # Step 1: Open Curriculum — primary button for in-progress courses,
         # dropdown menu item for completed ones (primary shows "View Certificate").
+        # CTA section renders after domcontentloaded — let the network settle
+        # so the duplex button is attached before we probe it.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
         await self._click_open_curriculum_or_dropdown(timeout_ms=60000)
 
         # Step 1b: Some courses expose the old-version CTA only after
@@ -1162,6 +1168,10 @@ class PortalNavigator:
         trigger_sel = self.selectors.get("open_curriculum_menu_trigger")
         menu_item_sel = self.selectors.get("open_curriculum_menu_item")
 
+        logger.info(
+            "Attempting Open Curriculum (primary button → dropdown → old-version fallback)"
+        )
+
         try:
             primary = page.locator(primary_sel).first
             await primary.wait_for(state="visible", timeout=3000)
@@ -1169,11 +1179,14 @@ class PortalNavigator:
             await self.session.wait_for_stable_page()
             logger.info("Clicked: Open Curriculum (primary button)")
             return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(
+                "Primary Open Curriculum button not visible within 3s: %s", e
+            )
 
         if trigger_sel and menu_item_sel:
             trigger_clicked = False
+            matched_trigger = ""
             for tsel in [s.strip() for s in trigger_sel.split(",") if s.strip()]:
                 try:
                     trigger = page.locator(tsel).first
@@ -1184,8 +1197,10 @@ class PortalNavigator:
                     await trigger.click()
                     logger.info("Opened duplex dropdown (via %s)", tsel)
                     trigger_clicked = True
+                    matched_trigger = tsel
                     break
-                except Exception:
+                except Exception as e:
+                    logger.debug("Dropdown trigger %s failed: %s", tsel, e)
                     continue
 
             if trigger_clicked:
@@ -1200,10 +1215,12 @@ class PortalNavigator:
                             msel,
                         )
                         return
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Menu item %s not clickable: %s", msel, e)
                         continue
-                logger.warning(
-                    "Opened dropdown but could not click Open Curriculum menu item"
+                raise CourseLaunchError(
+                    f"Dropdown opened via {matched_trigger} but Open Curriculum "
+                    f"menu item not found; tried {menu_item_sel}"
                 )
 
         await self._click_with_old_version_fallback(

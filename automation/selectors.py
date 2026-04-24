@@ -100,13 +100,15 @@ DEFAULT_SELECTORS: Dict[str, str] = {
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Open Curriculum"),'
         'button:has-text("Open Curriculum")'
     ),
-    # Chevron on the duplex button — appears for completed courses where
-    # the primary button is "View Certificate" and Open Curriculum is
-    # inside the dropdown menu.
+    # Chevron on the duplex button — Cornerstone CSOD exposes it as
+    # appendixButton with aria-haspopup="true". For completed courses
+    # the primary shows "View Certificate" and Open Curriculum lives
+    # inside this menu.
     "open_curriculum_menu_trigger": (
-        'button[data-testid="rcl$duplexedButton__secondaryButton"],'
-        'button[aria-haspopup="menu"][aria-expanded="false"],'
-        'button[data-testid*="duplexedButton"][data-testid*="secondary" i]'
+        'button[data-testid="rcl$duplexedButton__appendixButton"],'
+        'button[data-testid*="duplexedButton"][data-testid*="appendix" i],'
+        'button[aria-haspopup="true"][aria-label="More Actions"],'
+        'button[aria-haspopup="true"][aria-expanded="false"]'
     ),
     "open_curriculum_menu_item": (
         'li[role="menuitem"][aria-label^="Open Curriculum"],'
