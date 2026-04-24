@@ -76,6 +76,9 @@ class PortalNavigator:
         self.targets = targets
         # Set after select_pathway(); used to scope expand/find operations
         self._pathway_container: Optional[Locator] = None
+        # Cached URL of the pathways landing (populated after navigate_to_pathways()).
+        # Used by return_to_pathways_landing() between pathways in a multi-pathway run.
+        self._pathways_landing_url: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Step 1: Navigate to Pathways
@@ -90,6 +93,7 @@ class PortalNavigator:
         for selector in self.selectors.get_chain("pathway_tab_prefix"):
             if await page.locator(selector).count() > 0:
                 logger.info("Already on Pathways page (category tabs detected), skipping navigation")
+                self._pathways_landing_url = page.url
                 return
 
         # Portal widgets render dynamically — retry for up to ~10 seconds
@@ -99,6 +103,7 @@ class PortalNavigator:
                 locator = page.locator(selector)
                 if await locator.count() > 0:
                     await self._click_pathways_link(locator.first)
+                    self._pathways_landing_url = self.session.page.url
                     return
 
             # Fallback: find all "Pathways" text matches, click first visible one
@@ -108,12 +113,34 @@ class PortalNavigator:
                 el = pathways_all.nth(i)
                 if await el.is_visible():
                     await self._click_pathways_link(el)
+                    self._pathways_landing_url = self.session.page.url
                     return
 
             logger.debug("Pathways box not yet visible (attempt %d/10)", attempt + 1)
             await asyncio.sleep(1)
 
         raise NavigationError("Pathways box not found on the portal page")
+
+    async def return_to_pathways_landing(self) -> None:
+        """Re-enter the pathways landing view between pathways in a multi-pathway run.
+
+        Uses the URL cached by navigate_to_pathways(); falls back to a fresh
+        navigate_to_pathways() call if no URL has been captured yet.
+        """
+        page = self.session.page
+        # Reset any per-pathway state from the previous pathway
+        self._pathway_container = None
+
+        if self._pathways_landing_url:
+            logger.info(
+                "Returning to pathways landing: %s", self._pathways_landing_url
+            )
+            await page.goto(self._pathways_landing_url)
+            await self.session.wait_for_stable_page()
+            return
+
+        # No cached URL — try from scratch (handles first-pathway-failed edge cases)
+        await self.navigate_to_pathways()
 
     async def _click_pathways_link(self, locator: Locator) -> None:
         """Click the Pathways element, handling new-tab or same-page navigation."""

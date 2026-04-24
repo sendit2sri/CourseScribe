@@ -400,230 +400,257 @@ async def _run_multi_course_loop(
     from automation.state.courses_state import CoursesStateManager
     from automation.state.manifest import ManifestManager
 
-    # Load targets
-    targets = config.load_targets(config.targets_file)
+    # Load targets (one or more pathway blocks)
+    targets_file = config.load_targets(config.targets_file)
     selectors = _load_selectors(config)
 
-    # Initialize multi-course state
+    # Initialize multi-course state from every pathway up front so status/resume
+    # reflect the full file even if a later pathway fails.
     courses_state = CoursesStateManager(config.output_dir)
-    courses_state.init_from_targets(targets)
+    courses_state.init_from_targets_file(targets_file)
     courses_state.save()
 
     session = BrowserSession(config)
+    session_broken = False
 
     try:
         await session.start()
         await session.ensure_authenticated()
 
-        # Navigate to pathway
-        portal = PortalNavigator(session, selectors, targets)
-        await portal.navigate_to_pathways()
-        if targets.category:
-            await portal.select_category_tab(targets.category)
-        await portal.select_pathway(targets.pathway_name)
-        await portal.expand_course_section()
+        portal: Optional[PortalNavigator] = None
 
-        # Save portal page reference for tab management
-        session.save_as_portal_page()
-
-        pending = [
-            t for t in targets.pending_courses
-            if not courses_state.is_course_complete(t.name)
-        ]
-        completed_skipped = [
-            t.name for t in targets.pending_courses
-            if courses_state.is_course_complete(t.name)
-        ]
-        for name in completed_skipped:
-            print(f"  [SKIP] {name} -- already completed")
-        print(f"\n{len(pending)} course(s) to process\n")
-
-        for course_target in pending:
-            course_name = course_target.name
-            course_code = course_target.code
-            course_url = course_target.url
-            needs_manual_enrollment = course_target.needs_manual_enrollment
-
+        for pathway_idx, pathway_targets in enumerate(targets_file.pathways):
             if _shutdown_requested:
-                logger.info("Shutdown requested, stopping after current course")
+                logger.info("Shutdown requested, stopping before next pathway")
+                break
+            if session_broken:
+                logger.error("Session unrecoverable, aborting remaining pathways")
                 break
 
-            print(f"\n{'=' * 60}")
-            print(f"Starting: {course_name}")
-            print(f"{'=' * 60}\n")
+            print(f"\n{'#' * 60}")
+            print(f"Pathway {pathway_idx + 1}/{len(targets_file.pathways)}: "
+                  f"{pathway_targets.pathway_name}")
+            print(f"{'#' * 60}\n")
 
-            if needs_manual_enrollment:
-                msg = (
-                    "Marked needs_manual_enrollment in targets.json — "
-                    "user is not enrolled in the new version. Skipping."
-                )
-                print(f"  [SKIP] {course_name} -- {msg}")
-                logger.warning("Skipping %s: %s", course_name, msg)
-                courses_state.mark_failed(course_name, msg, "needs_manual_enrollment")
-                courses_state.save()
-                continue
+            # Fresh navigator per pathway (caches its own _pathway_container).
+            # The landing-URL cache on PortalNavigator is per-instance, so carry
+            # it across iterations by reusing the same navigator when possible.
+            if portal is None:
+                portal = PortalNavigator(session, selectors, pathway_targets)
+                await portal.navigate_to_pathways()
+            else:
+                portal.targets = pathway_targets
+                portal._pathway_container = None
+                await portal.return_to_pathways_landing()
 
-            course_dir_name = courses_state.course_output_dir(course_name)
-            full_course_dir = config.output_dir / course_dir_name
-            courses_state.mark_in_progress(course_name, course_dir_name)
-            courses_state.save()
+            if pathway_targets.category:
+                await portal.select_category_tab(pathway_targets.category)
+            await portal.select_pathway(pathway_targets.pathway_name)
+            await portal.expand_course_section()
 
-            try:
-                # Find and open course link (opens new tab)
-                if course_url:
-                    await portal.open_course_url(course_url)
-                else:
-                    await portal.open_course_link(course_name, course_code=course_code)
+            # Save portal page reference for tab management (overwrite per pathway)
+            session.save_as_portal_page()
 
-                # Launch course in the new tab
-                launch_result = await portal.launch_course()
+            pending = [
+                t for t in pathway_targets.pending_courses
+                if not courses_state.is_course_complete(t.name)
+            ]
+            completed_skipped = [
+                t.name for t in pathway_targets.pending_courses
+                if courses_state.is_course_complete(t.name)
+            ]
+            for name in completed_skipped:
+                print(f"  [SKIP] {name} -- already completed")
+            print(f"\n{len(pending)} course(s) to process in this pathway\n")
 
-                # Track old version redirect in state
-                if launch_result.old_version_redirected:
-                    entry = courses_state._courses.get(course_name)
-                    if entry:
-                        entry.old_version_redirect = launch_result.old_version_url
-                        courses_state._sync(course_name)
-                        courses_state.save()
-                    logger.info(
-                        "Course '%s' was an old version, redirected to: %s",
-                        course_name, launch_result.old_version_url,
-                    )
+            for course_target in pending:
+                course_name = course_target.name
+                course_code = course_target.code
+                course_url = course_target.url
+                needs_manual_enrollment = course_target.needs_manual_enrollment
 
-                # Extract curriculum sidebar before navigating into content
-                curriculum_data = None
-                try:
-                    curriculum_data = await portal.extract_curriculum_from_page()
-
-                    # Filter out "Course Document" items (PDF duplicates)
-                    curriculum_data["items"] = [
-                        item for item in curriculum_data["items"]
-                        if "course document" not in item.get("title", "").lower()
-                    ]
-                    curriculum_data["summary"]["total_items"] = len(
-                        curriculum_data["items"]
-                    )
-
-                    # Replace platform status with our capture status
-                    for item in curriculum_data["items"]:
-                        item["platform_status"] = item.pop("status", "unknown")
-                        if "capture_status" not in item:
-                            item["capture_status"] = "not_captured"
-
-                    if curriculum_data["summary"]["total_items"] > 0:
-                        curriculum_file = full_course_dir / "curriculum.json"
-                        full_course_dir.mkdir(parents=True, exist_ok=True)
-                        import json
-
-                        # Merge capture_status from previous run if exists
-                        if curriculum_file.exists():
-                            try:
-                                prev = json.loads(
-                                    curriculum_file.read_text(encoding="utf-8")
-                                )
-                                prev_by_pos = {
-                                    it["position"]: it
-                                    for it in prev.get("items", [])
-                                    if it.get("capture_status")
-                                }
-                                if prev_by_pos:
-                                    for item in curriculum_data["items"]:
-                                        prev_item = prev_by_pos.get(
-                                            item.get("position")
-                                        )
-                                        if prev_item:
-                                            item["capture_status"] = prev_item[
-                                                "capture_status"
-                                            ]
-                                            item["pages_captured"] = prev_item.get(
-                                                "pages_captured", 0
-                                            )
-                                    logger.info(
-                                        "Merged capture status from previous run"
-                                    )
-                            except Exception:
-                                pass
-
-                        with open(curriculum_file, 'w', encoding='utf-8') as f:
-                            json.dump(curriculum_data, f, indent=2, ensure_ascii=False)
-                            f.write('\n')
-                        logger.info(
-                            "Saved curriculum: %d items → %s",
-                            curriculum_data["summary"]["total_items"],
-                            curriculum_file,
-                        )
-                except Exception as e:
-                    logger.warning("Could not extract curriculum sidebar: %s", e)
-
-                # Run the per-course capture loop with curriculum iteration
-                await _run_single_course(
-                    session=session,
-                    config=config,
-                    selectors=selectors,
-                    course_output_dir=full_course_dir,
-                    skip_titles=targets.skip_titles,
-                    process_pages=process_pages,
-                    content_frame=launch_result.content_frame,
-                    portal=portal,
-                    curriculum_items=curriculum_data.get("items", []) if curriculum_data else [],
-                )
-
-                # Exit course
-                await portal.exit_course()
-
-                # Get page count from manifest
-                manifest = ManifestManager(full_course_dir)
-                total_pages = manifest.total_pages
-
-                # Close course tab, return to portal
-                await session.close_current_page()
-                await session.switch_to_portal_page()
-                await session.wait_for_stable_page()
-
-                courses_state.mark_completed(course_name, total_pages)
-                courses_state.save()
-
-                print(f"\nCompleted: {course_name} ({total_pages} pages)")
-
-                # Re-expand course section (portal may have reloaded)
-                try:
-                    await portal.expand_course_section()
-                except Exception:
-                    logger.debug("Could not re-expand course section (may still be visible)")
-
-            except (NavigationError, CourseLaunchError) as e:
-                logger.error("Course failed: %s: %s", course_name, e)
-                courses_state.mark_failed(course_name, str(e))
-                courses_state.save()
-
-                # Try to recover: close extra tabs, return to portal
-                try:
-                    await session.close_current_page()
-                    await session.switch_to_portal_page()
-                    await session.wait_for_stable_page()
-                    await portal.expand_course_section()
-                except Exception as recover_err:
-                    logger.error("Failed to recover to portal page: %s", recover_err)
-                    break  # Can't continue if we lost the portal
-
-                continue
-
-            except Exception as e:
-                logger.error("Unexpected error for %s: %s", course_name, e)
-                courses_state.mark_failed(course_name, str(e))
-                courses_state.save()
-
-                try:
-                    await session.close_current_page()
-                    await session.switch_to_portal_page()
-                    await session.wait_for_stable_page()
-                except Exception:
-                    logger.error("Failed to recover to portal page")
+                if _shutdown_requested:
+                    logger.info("Shutdown requested, stopping after current course")
                     break
 
-                continue
+                print(f"\n{'=' * 60}")
+                print(f"Starting: {course_name}")
+                print(f"{'=' * 60}\n")
 
-        # Final summary
+                if needs_manual_enrollment:
+                    msg = (
+                        "Marked needs_manual_enrollment in targets.json — "
+                        "user is not enrolled in the new version. Skipping."
+                    )
+                    print(f"  [SKIP] {course_name} -- {msg}")
+                    logger.warning("Skipping %s: %s", course_name, msg)
+                    courses_state.mark_failed(course_name, msg, "needs_manual_enrollment")
+                    courses_state.save()
+                    continue
+
+                course_dir_name = courses_state.course_output_dir(course_name)
+                full_course_dir = config.output_dir / course_dir_name
+                courses_state.mark_in_progress(course_name, course_dir_name)
+                courses_state.save()
+
+                try:
+                    # Find and open course link (opens new tab)
+                    if course_url:
+                        await portal.open_course_url(course_url)
+                    else:
+                        await portal.open_course_link(course_name, course_code=course_code)
+
+                    # Launch course in the new tab
+                    launch_result = await portal.launch_course()
+
+                    # Track old version redirect in state
+                    if launch_result.old_version_redirected:
+                        entry = courses_state._courses.get(course_name)
+                        if entry:
+                            entry.old_version_redirect = launch_result.old_version_url
+                            courses_state._sync(course_name)
+                            courses_state.save()
+                        logger.info(
+                            "Course '%s' was an old version, redirected to: %s",
+                            course_name, launch_result.old_version_url,
+                        )
+
+                    # Extract curriculum sidebar before navigating into content
+                    curriculum_data = None
+                    try:
+                        curriculum_data = await portal.extract_curriculum_from_page()
+
+                        # Filter out "Course Document" items (PDF duplicates)
+                        curriculum_data["items"] = [
+                            item for item in curriculum_data["items"]
+                            if "course document" not in item.get("title", "").lower()
+                        ]
+                        curriculum_data["summary"]["total_items"] = len(
+                            curriculum_data["items"]
+                        )
+
+                        # Replace platform status with our capture status
+                        for item in curriculum_data["items"]:
+                            item["platform_status"] = item.pop("status", "unknown")
+                            if "capture_status" not in item:
+                                item["capture_status"] = "not_captured"
+
+                        if curriculum_data["summary"]["total_items"] > 0:
+                            curriculum_file = full_course_dir / "curriculum.json"
+                            full_course_dir.mkdir(parents=True, exist_ok=True)
+                            import json
+
+                            # Merge capture_status from previous run if exists
+                            if curriculum_file.exists():
+                                try:
+                                    prev = json.loads(
+                                        curriculum_file.read_text(encoding="utf-8")
+                                    )
+                                    prev_by_pos = {
+                                        it["position"]: it
+                                        for it in prev.get("items", [])
+                                        if it.get("capture_status")
+                                    }
+                                    if prev_by_pos:
+                                        for item in curriculum_data["items"]:
+                                            prev_item = prev_by_pos.get(
+                                                item.get("position")
+                                            )
+                                            if prev_item:
+                                                item["capture_status"] = prev_item[
+                                                    "capture_status"
+                                                ]
+                                                item["pages_captured"] = prev_item.get(
+                                                    "pages_captured", 0
+                                                )
+                                        logger.info(
+                                            "Merged capture status from previous run"
+                                        )
+                                except Exception:
+                                    pass
+
+                            with open(curriculum_file, 'w', encoding='utf-8') as f:
+                                json.dump(curriculum_data, f, indent=2, ensure_ascii=False)
+                                f.write('\n')
+                            logger.info(
+                                "Saved curriculum: %d items → %s",
+                                curriculum_data["summary"]["total_items"],
+                                curriculum_file,
+                            )
+                    except Exception as e:
+                        logger.warning("Could not extract curriculum sidebar: %s", e)
+
+                    # Run the per-course capture loop with curriculum iteration
+                    await _run_single_course(
+                        session=session,
+                        config=config,
+                        selectors=selectors,
+                        course_output_dir=full_course_dir,
+                        skip_titles=pathway_targets.skip_titles,
+                        process_pages=process_pages,
+                        content_frame=launch_result.content_frame,
+                        portal=portal,
+                        curriculum_items=curriculum_data.get("items", []) if curriculum_data else [],
+                    )
+
+                    # Exit course
+                    await portal.exit_course()
+
+                    # Get page count from manifest
+                    manifest = ManifestManager(full_course_dir)
+                    total_pages = manifest.total_pages
+
+                    # Close course tab, return to portal
+                    await session.close_current_page()
+                    await session.switch_to_portal_page()
+                    await session.wait_for_stable_page()
+
+                    courses_state.mark_completed(course_name, total_pages)
+                    courses_state.save()
+
+                    print(f"\nCompleted: {course_name} ({total_pages} pages)")
+
+                    # Re-expand course section (portal may have reloaded)
+                    try:
+                        await portal.expand_course_section()
+                    except Exception:
+                        logger.debug("Could not re-expand course section (may still be visible)")
+
+                except (NavigationError, CourseLaunchError) as e:
+                    logger.error("Course failed: %s: %s", course_name, e)
+                    courses_state.mark_failed(course_name, str(e))
+                    courses_state.save()
+
+                    # Try to recover: close extra tabs, return to portal
+                    try:
+                        await session.close_current_page()
+                        await session.switch_to_portal_page()
+                        await session.wait_for_stable_page()
+                        await portal.expand_course_section()
+                    except Exception as recover_err:
+                        logger.error("Failed to recover to portal page: %s", recover_err)
+                        session_broken = True
+                        break  # Can't continue if we lost the portal
+
+                    continue
+
+                except Exception as e:
+                    logger.error("Unexpected error for %s: %s", course_name, e)
+                    courses_state.mark_failed(course_name, str(e))
+                    courses_state.save()
+
+                    try:
+                        await session.close_current_page()
+                        await session.switch_to_portal_page()
+                        await session.wait_for_stable_page()
+                    except Exception:
+                        logger.error("Failed to recover to portal page")
+                        session_broken = True
+                        break
+
+                    continue
+
+        # Final summary (across all pathways)
         print("\n" + courses_state.summary_text())
 
     finally:

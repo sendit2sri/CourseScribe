@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from automation.config import CourseTarget, TargetsConfig
+from automation.config import CourseTarget, TargetsConfig, TargetsFile
 
 logger = logging.getLogger(__name__)
 
@@ -154,14 +154,22 @@ class CoursesStateManager:
             index[name] = CourseEntry.from_dict(name, data)
         return index
 
-    def init_from_targets(self, targets: TargetsConfig) -> None:
-        """Populate course entries from targets.json.
+    def init_from_targets_file(self, targets_file: TargetsFile) -> None:
+        """Populate course entries from all pathways in targets.json.
 
         Idempotent: only adds courses not already present (for resume).
         Backfills course_code and pathway_name on existing entries.
         """
-        self._state["pathway_name"] = targets.pathway_name
+        # Clear the legacy single-pathway key; per-entry pathway_name is authoritative.
+        self._state["pathway_name"] = ""
+        for pathway in targets_file.pathways:
+            self._init_from_pathway(pathway)
 
+    def init_from_targets(self, targets: TargetsConfig) -> None:
+        """Single-pathway initializer (kept for callers still operating on one pathway)."""
+        self._init_from_pathway(targets)
+
+    def _init_from_pathway(self, targets: TargetsConfig) -> None:
         for course_target in targets.pending_courses:
             if course_target.name not in self._courses:
                 dir_name = _build_course_dir_name(course_target.name)
@@ -174,7 +182,12 @@ class CoursesStateManager:
                 )
                 self._courses[course_target.name] = entry
                 self._state["courses"][course_target.name] = entry.to_dict()
-                logger.info("Added course: %s -> %s/", course_target.name, dir_name)
+                logger.info(
+                    "Added course: %s (%s) -> %s/",
+                    course_target.name,
+                    targets.pathway_name,
+                    dir_name,
+                )
             else:
                 # Backfill code and pathway on existing entries
                 entry = self._courses[course_target.name]
@@ -260,43 +273,66 @@ class CoursesStateManager:
         logger.debug("Courses state saved")
 
     def summary_text(self) -> str:
-        """Human-readable summary of all courses."""
+        """Human-readable summary of all courses, grouped by pathway."""
         lines = [
             "CourseScribe Multi-Course Status",
             "=" * 50,
-            f"Pathway: {self._state.get('pathway_name', '(unknown)')}",
-            "",
         ]
-        completed = 0
-        failed = 0
-        pending = 0
 
-        for name, entry in self._courses.items():
-            status_icon = {
-                COURSE_COMPLETED: "[done]",
-                COURSE_IN_PROGRESS: "[...]",
-                COURSE_FAILED: "[FAIL]",
-                COURSE_PENDING: "[    ]",
-            }.get(entry.status, "[?]")
+        # Group by pathway, preserving insertion order
+        groups: Dict[str, List[CourseEntry]] = {}
+        for entry in self._courses.values():
+            key = entry.pathway_name or "(unknown pathway)"
+            groups.setdefault(key, []).append(entry)
 
-            line = f"  {status_icon} {name}"
-            if entry.total_pages:
-                line += f" ({entry.total_pages} pages)"
-            if entry.old_version_redirect:
-                line += " [redirected -> new version]"
-            if entry.last_error:
-                line += f" -- {entry.last_error}"
-            lines.append(line)
+        total_completed = 0
+        total_failed = 0
+        total_pending = 0
 
-            if entry.status == COURSE_COMPLETED:
-                completed += 1
-            elif entry.status == COURSE_FAILED:
-                failed += 1
-            else:
-                pending += 1
+        for pathway_name, entries in groups.items():
+            lines.append("")
+            lines.append(f"Pathway: {pathway_name}")
+            lines.append("-" * 50)
+
+            p_completed = 0
+            p_failed = 0
+            p_pending = 0
+
+            for entry in entries:
+                status_icon = {
+                    COURSE_COMPLETED: "[done]",
+                    COURSE_IN_PROGRESS: "[...]",
+                    COURSE_FAILED: "[FAIL]",
+                    COURSE_PENDING: "[    ]",
+                }.get(entry.status, "[?]")
+
+                line = f"  {status_icon} {entry.name}"
+                if entry.total_pages:
+                    line += f" ({entry.total_pages} pages)"
+                if entry.old_version_redirect:
+                    line += " [redirected -> new version]"
+                if entry.last_error:
+                    line += f" -- {entry.last_error}"
+                lines.append(line)
+
+                if entry.status == COURSE_COMPLETED:
+                    p_completed += 1
+                elif entry.status == COURSE_FAILED:
+                    p_failed += 1
+                else:
+                    p_pending += 1
+
+            lines.append(
+                f"  Completed: {p_completed} | Failed: {p_failed} | Remaining: {p_pending}"
+            )
+            total_completed += p_completed
+            total_failed += p_failed
+            total_pending += p_pending
 
         lines.append("")
+        lines.append("=" * 50)
         lines.append(
-            f"Completed: {completed} | Failed: {failed} | Remaining: {pending}"
+            f"TOTAL — Completed: {total_completed} | Failed: {total_failed}"
+            f" | Remaining: {total_pending}"
         )
         return "\n".join(lines)

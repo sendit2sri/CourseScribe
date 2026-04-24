@@ -29,12 +29,19 @@ class CourseTarget:
 
 @dataclass
 class TargetsConfig:
-    """Parsed contents of targets.json."""
+    """A single pathway block from targets.json."""
 
     pathway_name: str
     pending_courses: List[CourseTarget]
     category: str = ""
     skip_titles: List[str] = field(default_factory=lambda: ["Course Document"])
+
+
+@dataclass
+class TargetsFile:
+    """Parsed contents of targets.json — one or more pathway blocks."""
+
+    pathways: List[TargetsConfig]
 
 
 DEFAULT_BROWSER_DATA_DIR = Path.home() / ".coursescribe" / "browser_profile"
@@ -235,14 +242,20 @@ class AutomationConfig:
             force=True,
         )
 
-    def load_targets(self, path: Optional[Path] = None) -> TargetsConfig:
+    def load_targets(self, path: Optional[Path] = None) -> TargetsFile:
         """Load and validate targets.json.
+
+        Supports two on-disk shapes:
+          - Wrapped (preferred): ``{"targets": [ {pathway_block}, ... ]}`` — every
+            element in the array becomes a separate pathway, processed in order.
+          - Flat (single-pathway legacy): a bare ``{pathway_block}`` at the top
+            level, wrapped into a single-pathway TargetsFile.
 
         Args:
             path: Explicit path, or falls back to self.targets_file, then ./targets.json.
 
         Returns:
-            Parsed TargetsConfig.
+            TargetsFile with one or more pathways.
 
         Raises:
             FileNotFoundError: If the file does not exist.
@@ -257,62 +270,83 @@ class AutomationConfig:
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in {targets_path}: {e}") from e
 
-        # Support both flat format and nested "targets" array format
-        if "targets" in data and isinstance(data["targets"], list) and data["targets"]:
-            entry = data["targets"][0]
-            category = entry.get("category", "")
-            pathway_name = entry.get("pathway_name", "")
-            raw_courses = entry.get("pending_courses", [])
-            # Handle course objects with "name"+"code" keys or plain strings
-            pending_courses = [
-                CourseTarget(
-                    name=c["name"],
-                    code=c.get("code", ""),
-                    url=c.get("url", ""),
-                    needs_manual_enrollment=c.get("needs_manual_enrollment", False),
-                )
-                if isinstance(c, dict)
-                else CourseTarget(name=c)
-                for c in raw_courses
-            ]
-            skip_titles = entry.get("skip_titles", ["Course Document"])
+        if "targets" in data and isinstance(data["targets"], list):
+            raw_entries = data["targets"]
         else:
-            category = data.get("category", "")
-            pathway_name = data.get("pathway_name", "")
-            raw = data.get("pending_courses", [])
-            pending_courses = [
-                CourseTarget(
-                    name=c["name"],
-                    code=c.get("code", ""),
-                    url=c.get("url", ""),
-                    needs_manual_enrollment=c.get("needs_manual_enrollment", False),
+            raw_entries = [data]
+
+        if not raw_entries:
+            raise ValueError(f"No pathway entries found in {targets_path}")
+
+        pathways: List[TargetsConfig] = []
+        for idx, entry in enumerate(raw_entries):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"{targets_path}: pathway entry #{idx + 1} is not an object"
                 )
-                if isinstance(c, dict)
-                else CourseTarget(name=c)
-                for c in raw
-            ]
-            skip_titles = data.get("skip_titles", ["Course Document"])
+            pathways.append(self._parse_pathway_entry(entry, targets_path, idx))
 
-        if not pathway_name:
-            raise ValueError(f"Missing 'pathway_name' in {targets_path}")
-
-        if not pending_courses:
-            raise ValueError(f"Missing or empty 'pending_courses' in {targets_path}")
-
-        # Warn on duplicate course codes
-        codes = [c.code for c in pending_courses if c.code]
-        seen = set()
-        for code in codes:
-            if code in seen:
-                logger.warning("Duplicate course code in targets: %s", code)
-            seen.add(code)
+        # Warn on duplicate (pathway_name, course_code) pairs across the whole file
+        seen_pairs: set = set()
+        for p in pathways:
+            for c in p.pending_courses:
+                if not c.code:
+                    continue
+                key = (p.pathway_name, c.code)
+                if key in seen_pairs:
+                    logger.warning(
+                        "Duplicate (pathway, course_code) in targets: %s / %s",
+                        p.pathway_name,
+                        c.code,
+                    )
+                seen_pairs.add(key)
 
         logger.info(
-            "Loaded targets: pathway=%s, courses=%d, skip_titles=%s",
-            pathway_name,
-            len(pending_courses),
-            skip_titles,
+            "Loaded targets: %d pathway(s), %d course(s) total",
+            len(pathways),
+            sum(len(p.pending_courses) for p in pathways),
         )
+        for p in pathways:
+            logger.info(
+                "  pathway=%s, courses=%d, skip_titles=%s",
+                p.pathway_name,
+                len(p.pending_courses),
+                p.skip_titles,
+            )
+        return TargetsFile(pathways=pathways)
+
+    @staticmethod
+    def _parse_pathway_entry(
+        entry: dict, targets_path: Path, idx: int
+    ) -> TargetsConfig:
+        """Parse one pathway block dict into a TargetsConfig."""
+        pathway_name = entry.get("pathway_name", "")
+        category = entry.get("category", "")
+        raw_courses = entry.get("pending_courses", [])
+        skip_titles = entry.get("skip_titles", ["Course Document"])
+
+        pending_courses = [
+            CourseTarget(
+                name=c["name"],
+                code=c.get("code", ""),
+                url=c.get("url", ""),
+                needs_manual_enrollment=c.get("needs_manual_enrollment", False),
+            )
+            if isinstance(c, dict)
+            else CourseTarget(name=c)
+            for c in raw_courses
+        ]
+
+        if not pathway_name:
+            raise ValueError(
+                f"Missing 'pathway_name' in pathway entry #{idx + 1} of {targets_path}"
+            )
+        if not pending_courses:
+            raise ValueError(
+                f"Missing or empty 'pending_courses' in pathway '{pathway_name}'"
+                f" of {targets_path}"
+            )
+
         return TargetsConfig(
             pathway_name=pathway_name,
             pending_courses=pending_courses,
