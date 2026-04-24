@@ -100,6 +100,19 @@ DEFAULT_SELECTORS: Dict[str, str] = {
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Open Curriculum"),'
         'button:has-text("Open Curriculum")'
     ),
+    # Chevron on the duplex button — appears for completed courses where
+    # the primary button is "View Certificate" and Open Curriculum is
+    # inside the dropdown menu.
+    "open_curriculum_menu_trigger": (
+        'button[data-testid="rcl$duplexedButton__secondaryButton"],'
+        'button[aria-haspopup="menu"][aria-expanded="false"],'
+        'button[data-testid*="duplexedButton"][data-testid*="secondary" i]'
+    ),
+    "open_curriculum_menu_item": (
+        'li[role="menuitem"][aria-label^="Open Curriculum"],'
+        'li[role="menuitem"][data-test="LD_Call_To_Action_Secondary_Action"]:has-text("Open Curriculum"),'
+        '[role="menu"] [role="menuitem"]:has-text("Open Curriculum")'
+    ),
     "launch_button": (
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Launch")'
     ),
