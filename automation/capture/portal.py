@@ -56,6 +56,7 @@ class LaunchResult:
     final_page_title: str = ""
     old_version_redirected: bool = False
     old_version_url: str = ""
+    course_already_completed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +621,26 @@ class PortalNavigator:
             self._old_version_followed_during_launch = True
             self._old_version_followed_url = page.url
 
+        # Step 1c: Detect fully-completed course state. The curriculum page
+        # for a completed course shows "Evaluate" (the optional post-test) as
+        # the primary CTA instead of "Launch". Skip Steps 2–4; per-lesson
+        # Launch is handled inside click_curriculum_item.
+        if await self._evaluate_primary_visible():
+            logger.info(
+                "Course already completed — Evaluate (not Launch) primary CTA "
+                "detected; skipping Launch/Fullscreen/Resume steps"
+            )
+            result.course_already_completed = True
+            content = await self.detect_content_frame()
+            if isinstance(content, Frame):
+                result.iframe_detected = True
+            result.content_frame = content
+            try:
+                result.final_page_title = await page.title()
+            except Exception:
+                result.final_page_title = ""
+            return result
+
         # Step 2: Launch (with old-version fallback on timeout).
         await self._click_with_old_version_fallback(
             self.selectors.get("launch_button"),
@@ -1050,6 +1071,22 @@ class PortalNavigator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _evaluate_primary_visible(self) -> bool:
+        """Return True if the duplex primary CTA is the post-test "Evaluate"
+        button (signals a fully-completed course on the curriculum page).
+        """
+        page = self.session.page
+        for selector in self.selectors.get_chain("evaluate_button"):
+            try:
+                button = await page.query_selector(selector)
+                if button and await button.is_visible():
+                    logger.debug("Evaluate primary detected (selector=%s)", selector)
+                    return True
+            except Exception as e:
+                logger.debug("Evaluate probe selector '%s' failed: %s", selector, e)
+                continue
+        return False
 
     async def _wait_and_click(
         self,
