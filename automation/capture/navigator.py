@@ -158,6 +158,24 @@ class CourseNavigator:
         """
         page = self.content_page
 
+        # End-of-course detection: some courses terminate on an optional
+        # "Evaluate" (post-test) page. Do not click Evaluate — return None so
+        # the outer multi-course loop exits the course via portal.exit_course()
+        # and advances to the next course in targets.json.
+        for selector in self.selectors.get_chain("evaluate_button"):
+            try:
+                button = await page.query_selector(selector)
+                if button and await button.is_visible():
+                    logger.info(
+                        "Evaluate page detected (selector=%s); skipping exam "
+                        "and signalling end-of-course.",
+                        selector,
+                    )
+                    return None
+            except Exception as e:
+                logger.debug("Evaluate selector '%s' failed: %s", selector, e)
+                continue
+
         # Capture DOM text fingerprint before clicking (for SPA change detection)
         old_text = ""
         try:
