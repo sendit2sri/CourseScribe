@@ -621,10 +621,27 @@ class PortalNavigator:
             self._old_version_followed_during_launch = True
             self._old_version_followed_url = page.url
 
-        # Step 1c: Detect fully-completed course state. The curriculum page
-        # for a completed course shows "Evaluate" (the optional post-test) as
-        # the primary CTA instead of "Launch". Skip Steps 2–4; per-lesson
-        # Launch is handled inside click_curriculum_item.
+        # Step 1c: Wait for the duplex primary CTA to render (Launch for
+        # in-progress courses, Evaluate for fully-completed ones), then
+        # branch. Without this wait the Evaluate probe runs before the
+        # curriculum page paints and falsely falls through to Step 2.
+        launch_sel = self.selectors.get("launch_button")
+        eval_sel = self.selectors.get("evaluate_button")
+        combined = ", ".join(s for s in (launch_sel, eval_sel) if s)
+        if combined:
+            try:
+                await page.wait_for_selector(
+                    combined, state="visible", timeout=30000
+                )
+            except Exception:
+                logger.debug(
+                    "Neither Launch nor Evaluate primary CTA appeared within 30s"
+                )
+
+        # Detect fully-completed course state. The curriculum page for a
+        # completed course shows "Evaluate" (the optional post-test) as the
+        # primary CTA instead of "Launch". Skip Steps 2–4; per-lesson Launch
+        # is handled inside click_curriculum_item.
         if await self._evaluate_primary_visible():
             logger.info(
                 "Course already completed — Evaluate (not Launch) primary CTA "
