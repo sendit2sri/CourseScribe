@@ -794,6 +794,11 @@ class PortalNavigator:
             if await dur_loc.count() > 0:
                 total_duration = (await dur_loc.inner_text()).strip()
 
+        # Some curricula nest lessons under collapsed level-1 section groups
+        # (e.g., "Lessons", "Course Document", "Post-Curriculum Completion
+        # Activities"). Expand them so all level-2 items are present in the DOM.
+        await self._expand_all_curriculum_groups()
+
         # Training items from tree
         items = []
         item_sel = self.selectors.get("curriculum_tree_item")
@@ -807,6 +812,31 @@ class PortalNavigator:
                 node_id = await item.get_attribute("data-node-id") or ""
                 position = await item.get_attribute("aria-posinset") or ""
                 total = await item.get_attribute("aria-setsize") or ""
+
+                # Skip items in non-lesson sections (Course Document,
+                # Post-Curriculum Completion Activities → Evaluation, etc.).
+                section_title = await item.evaluate(
+                    """el => {
+                        const ul = el.closest('ul[role="group"]');
+                        if (!ul) return '';
+                        const id = ul.getAttribute('aria-labelledby') || '';
+                        const wrapper = id ? document.getElementById(id) : null;
+                        if (!wrapper) return '';
+                        const t = wrapper.querySelector('.titlesNew, .titles');
+                        return (t?.getAttribute('content')
+                            || t?.textContent || '').trim();
+                    }"""
+                )
+                norm = section_title.lower()
+                if (
+                    "post-curriculum" in norm
+                    or norm == "course document"
+                ):
+                    logger.debug(
+                        "Skipping item under section '%s': %s",
+                        section_title, node_id,
+                    )
+                    continue
 
                 # Title from .titles element
                 title = ""
@@ -1088,6 +1118,33 @@ class PortalNavigator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _expand_all_curriculum_groups(self) -> None:
+        """Expand every collapsed level-1 group in the curriculum tree so
+        their level-2 children are present in the DOM. Loops a few times
+        because expanding one group may add new collapsed siblings.
+        """
+        page = self.session.page
+        for _ in range(3):
+            collapsed = page.locator(
+                '[role="treeitem"][aria-level="1"][aria-expanded="false"]'
+            )
+            count = await collapsed.count()
+            if count == 0:
+                return
+            for i in range(count):
+                node = collapsed.nth(i)
+                btn = node.locator(
+                    'button[data-testid^="rcl$tree_expand_Icon_"]'
+                ).first
+                if await btn.count() == 0:
+                    continue
+                try:
+                    await btn.click()
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.debug("Expand level-1 group failed: %s", e)
+            await asyncio.sleep(0.3)
 
     async def _evaluate_primary_visible(self) -> bool:
         """Return True if the duplex primary CTA is the post-test "Evaluate"
