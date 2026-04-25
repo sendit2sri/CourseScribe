@@ -17,8 +17,10 @@ Navigation flow:
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Union
+from urllib.parse import urlparse
 
 from playwright.async_api import Frame, Locator, Page
 
@@ -529,8 +531,34 @@ class PortalNavigator:
         )
 
     async def open_course_via_global_search(self, course_code: str) -> None:
-        """Find a course via global search and click it, opening a new tab."""
+        """Find a course via global search and open its curriculum in a new tab.
+
+        Cornerstone CSOD's legacy search renders title links as
+        ``href="javascript:GetTrainingNavUrl('<uuid>')"``. A plain click runs
+        the JS function and only mutates the search-page URL fragment, so the
+        new tab never reaches the curriculum view. Resolve the UUID from the
+        href and open the real curriculum URL directly.
+        """
         result = await self.find_via_global_search(course_code)
+
+        href = await result.get_attribute("href") or ""
+        uuid_match = re.search(
+            r"GetTrainingNavUrl\('([0-9a-fA-F-]{16,})'\)", href
+        )
+        if uuid_match:
+            uuid = uuid_match.group(1)
+            host = urlparse(self.session.page.url).netloc or "temenos.csod.com"
+            url = (
+                f"https://{host}/ui/lms-learning-details/app/curriculum/"
+                f"{uuid}#t=1"
+            )
+            logger.info(
+                "Resolved global search result for %s to curriculum URL: %s",
+                course_code, url,
+            )
+            await self.open_course_url(url)
+            return
+
         try:
             await result.scroll_into_view_if_needed()
         except Exception:

@@ -92,7 +92,11 @@ DEFAULT_SELECTORS: Dict[str, str] = {
         'input[placeholder*="Search" i]'
     ),
     "global_search_result_link": (
+        # Cornerstone CSOD legacy result rows expose the title link with
+        # data-tag="hlkTitle" and href="javascript:GetTrainingNavUrl('<uuid>')".
+        'a[data-tag="hlkTitle"],'
         '[class*="search-result"] a,'
+        '[class*="srch-rslt"] a,'
         '[data-testid*="searchResult" i] a,'
         'a[href*="lms-learning-details"]'
     ),
@@ -122,6 +126,14 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     "dismiss_resume_no": '.uikit-primary-button:has-text("No"), button:has-text("No"), a:has-text("No")',
     "exit_course_button": (
         'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Exit Course")'
+    ),
+    # Post-test Evaluate page — optional exam that terminates some courses.
+    # We do NOT click this; presence signals end-of-course so the multi-course
+    # loop can advance to the next course.
+    "evaluate_button": (
+        '#trainingDropdownDiv button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Evaluate"),'
+        '[data-testid="training-dropdown"] button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Evaluate"),'
+        'button[data-testid="rcl$duplexedButton__primaryButton"]:has-text("Evaluate")'
     ),
 
     # ---- In-course platform-specific ----
