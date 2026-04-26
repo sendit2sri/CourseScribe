@@ -83,13 +83,18 @@ DEFAULT_SELECTORS: Dict[str, str] = {
         'input[type="search"],'
         '[data-testid*="search" i] input,'
         '#searchBox input,'
-        'input[placeholder*="Search" i]'
+        'input[placeholder*="Search" i],'
+        # Cornerstone CSOD legacy GlobalSearch/search.aspx page
+        'input[data-tag="txtsearch"],'
+        'input.txtsearch'
     ),
     "global_search_input": (
         'input[type="search"],'
         '[data-testid*="search" i] input,'
         '#searchBox input,'
-        'input[placeholder*="Search" i]'
+        'input[placeholder*="Search" i],'
+        'input[data-tag="txtsearch"],'
+        'input.txtsearch'
     ),
     "global_search_result_link": (
         # Cornerstone CSOD legacy result rows expose the title link with
