@@ -482,7 +482,9 @@ class PortalNavigator:
 
         trigger = page.locator(trigger_sel).first
         if await trigger.count() == 0:
-            raise NavigationError("Global search trigger not found on portal")
+            raise NavigationError(
+                f"Global search trigger not found on portal (url={page.url})"
+            )
 
         tag_name = (
             await trigger.evaluate("(el) => el.tagName")
