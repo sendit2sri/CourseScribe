@@ -80,6 +80,12 @@ DEFAULT_SELECTORS: Dict[str, str] = {
     # ---- Global search fallback (used when a course isn't on its pathway page) ----
     "global_search_trigger": (
         'button[aria-label*="Search" i],'
+        # Cornerstone CSOD legacy pathway/catalog header search icon —
+        # rendered as <a role="button" class="c-search-icon"
+        # aria-label="Click to start searching">, not a <button>.
+        'a[role="button"][aria-label*="Search" i],'
+        'a.c-search-icon,'
+        '[class*="c-search-icon"],'
         'input[type="search"],'
         '[data-testid*="search" i] input,'
         '#searchBox input,'
