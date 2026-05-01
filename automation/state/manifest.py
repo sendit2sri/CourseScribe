@@ -401,6 +401,33 @@ class ManifestManager:
         state.error = error
         self._sync_state(page_id)
 
+    def mark_item_failed(
+        self, position: int, title: str, reason: str
+    ) -> None:
+        """Record a curriculum-item-level launch failure.
+
+        Used by the per-item watchdog when an item never reaches a
+        capture-ready state. Stored on run_state under "failed_items"
+        as a list of records so resume can skip them.
+        """
+        items = self._state.setdefault("failed_items", [])
+        items.append(
+            {
+                "position": position,
+                "title": title,
+                "reason": reason,
+                "failed_at": _now(),
+            }
+        )
+
+    def is_item_failed(self, position: int) -> bool:
+        """True if the curriculum item at the given position previously
+        failed to launch in this run."""
+        for entry in self._state.get("failed_items", []):
+            if entry.get("position") == position:
+                return True
+        return False
+
     def update_position(self, page_info: PageInfo) -> None:
         """Update current position in the course."""
         self._state["current_position"] = {

@@ -81,8 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Auto-crop tables/diagrams/screenshots")
     capture_args.add_argument("--capture-mode", choices=["full", "viewport", "section"],
                               default="full")
-    capture_args.add_argument("--page-delay", type=float, default=3.0,
-                              help="Delay between pages in seconds (default: 3.0)")
+    capture_args.add_argument("--page-delay", type=float, default=1.0,
+                              help="Delay between pages in seconds (default: 1.0)")
     capture_args.add_argument("--selectors-file", type=Path, default=None)
     capture_args.add_argument("--idle-pause-interval", type=str, default="15-30",
                               help="Pages between reading breaks as 'min-max' (default: 15-30). Set '0' to disable.")
@@ -90,6 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Reading break duration range in seconds as 'min-max' (default: 120-300)")
     capture_args.add_argument("--batch-size", type=int, default=0,
                               help="Auto-stop after N pages per batch; 0=disabled (default: 0). Exit code 2 when reached.")
+    capture_args.add_argument("--item-launch-timeout", type=float, default=180.0,
+                              help="Per-item watchdog: skip a curriculum item if it does not become capture-ready within this many seconds (default: 180).")
     capture_args.add_argument("--dry-run", action="store_true")
 
     # --- Commands ---
@@ -209,6 +211,8 @@ def args_to_config(args: argparse.Namespace) -> AutomationConfig:
         config.idle_pause_duration_max = float(hi)
     if hasattr(args, "batch_size"):
         config.batch_size = args.batch_size
+    if hasattr(args, "item_launch_timeout"):
+        config.item_launch_timeout = args.item_launch_timeout
 
     # Set operation mode based on command
     config.login_mode = args.command == "login"
@@ -751,16 +755,33 @@ async def _run_single_course(
                 title,
             )
 
-            # Click the curriculum item in the sidebar (with retries)
+            # Click the curriculum item in the sidebar.
+            # Watchdog: a hung Cornerstone player has historically blocked
+            # this call for 50+ minutes. Cap each attempt at
+            # config.item_launch_timeout. A timeout is treated as terminal
+            # (no further retries) — re-clicking a stuck iframe does not
+            # recover. Other exceptions still get up to 3 attempts.
             item_result = None
+            launch_timed_out = False
             for attempt in range(3):
                 try:
-                    item_result = await portal.click_curriculum_item(position, node_id)
+                    item_result = await asyncio.wait_for(
+                        portal.click_curriculum_item(position, node_id),
+                        timeout=config.item_launch_timeout,
+                    )
                     # Update content frame (iframe may have reloaded)
                     if item_result.content_frame is not None:
                         navigator.set_content_frame(item_result.content_frame)
                         capturer.set_content_frame(item_result.content_frame)
                     break  # success
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Curriculum item %d (%s) did not become ready within "
+                        "%.0fs — marking failed_launch and advancing",
+                        position, title, config.item_launch_timeout,
+                    )
+                    launch_timed_out = True
+                    break
                 except Exception as e:
                     logger.warning(
                         "Attempt %d/3 failed for curriculum item %d (%s): %s",
@@ -770,14 +791,20 @@ async def _run_single_course(
                         await asyncio.sleep(3)
 
             if item_result is None:
-                logger.error(
-                    "Skipping curriculum item %d (%s) after 3 failed attempts",
-                    position, title,
-                )
+                if launch_timed_out:
+                    manifest.mark_item_failed(position, title, "launch_timeout")
+                    manifest.save()
+                    status = "failed_launch"
+                else:
+                    logger.error(
+                        "Skipping curriculum item %d (%s) after 3 failed attempts",
+                        position, title,
+                    )
+                    status = "failed"
                 curriculum_results.append({
                     "position": position,
                     "title": title,
-                    "status": "failed",
+                    "status": status,
                     "pages_captured": 0,
                 })
                 continue
@@ -1015,19 +1042,31 @@ async def _run_single_course(
     if curriculum_results:
         total_items = len(curriculum_results)
         ok_count = sum(1 for r in curriculum_results if r["status"] == "captured")
-        fail_count = sum(1 for r in curriculum_results if r["status"] == "failed")
+        fail_count = sum(
+            1 for r in curriculum_results
+            if r["status"] in ("failed", "failed_launch")
+        )
+        timeout_count = sum(
+            1 for r in curriculum_results if r["status"] == "failed_launch"
+        )
         no_pages_count = sum(1 for r in curriculum_results if r["status"] == "no_pages")
         total_pages = sum(r["pages_captured"] for r in curriculum_results)
 
         print(f"\nCurriculum Capture Summary ({total_items} items)")
         print("=" * 50)
         for r in curriculum_results:
-            icon = {"captured": "[OK]  ", "failed": "[FAIL]", "no_pages": "[SKIP]"}
+            icon = {
+                "captured": "[OK]  ",
+                "failed": "[FAIL]",
+                "failed_launch": "[TIME]",
+                "no_pages": "[SKIP]",
+            }
             status = icon.get(r["status"], "[?]   ")
             pages_str = f"({r['pages_captured']} pages)" if r["pages_captured"] else ""
             print(f"  {status} {r['position']:2d}. {r['title']} {pages_str}")
+        timeout_str = f" (of which {timeout_count} timed out)" if timeout_count else ""
         print(f"\nCaptured: {ok_count}/{total_items} | "
-              f"Failed: {fail_count} | Skipped: {no_pages_count} | "
+              f"Failed: {fail_count}{timeout_str} | Skipped: {no_pages_count} | "
               f"Total pages: {total_pages}")
 
         # Update curriculum.json with capture results

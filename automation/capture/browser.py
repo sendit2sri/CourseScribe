@@ -705,8 +705,15 @@ class BrowserSession:
         timeout = timeout_ms or self.config.stable_wait_ms
         quiet_ms = self.config.mutation_quiet_ms
 
+        # Cap the networkidle wait separately from the overall ceiling.
+        # Cornerstone heartbeats keep the network busy, so this rarely
+        # resolves cleanly — the MutationObserver block below is the
+        # actual stability signal. Don't let networkidle dominate.
+        networkidle_timeout = min(timeout, 5000)
         try:
-            await self._page.wait_for_load_state("networkidle", timeout=timeout)
+            await self._page.wait_for_load_state(
+                "networkidle", timeout=networkidle_timeout
+            )
         except Exception:
             logger.debug("Network idle timeout — continuing with DOM check")
 

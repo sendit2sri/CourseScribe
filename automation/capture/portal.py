@@ -18,6 +18,7 @@ Navigation flow:
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Union
 from urllib.parse import urlparse
@@ -637,10 +638,12 @@ class PortalNavigator:
 
         # Step 1: Open Curriculum — primary button for in-progress courses,
         # dropdown menu item for completed ones (primary shows "View Certificate").
-        # CTA section renders after domcontentloaded — let the network settle
-        # so the duplex button is attached before we probe it.
+        # The CTA section renders after domcontentloaded; the explicit
+        # wait_for_selector for the duplex button below (Step 1c) is the real
+        # readiness gate. Cornerstone's heartbeats prevent networkidle from
+        # firing in <8s, so it just burns the timeout — use domcontentloaded.
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
         except Exception:
             pass
         await self._click_open_curriculum_or_dropdown(timeout_ms=60000)
@@ -1007,18 +1010,24 @@ class PortalNavigator:
         await item_locator.dispatch_event("click")
         logger.info("Clicked curriculum item %d", position)
 
-        # Wait for iframe src to change (confirms platform loaded new item)
+        # Wait for iframe src to change (confirms platform loaded new item).
+        # Hard wall-clock deadline + bounded per-probe timeout so a degraded
+        # page can't inflate this loop into minutes (a single Playwright probe
+        # on a stuck page can otherwise inherit a 30s default).
         src_changed = False
-        for _ in range(30):  # 30 x 0.5s = 15s max
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
             try:
                 iframe_loc = page.locator(iframe_sel).first
-                if await iframe_loc.count() > 0:
-                    new_src = await iframe_loc.get_attribute("src") or ""
+                if await asyncio.wait_for(iframe_loc.count(), timeout=2.0) > 0:
+                    new_src = await asyncio.wait_for(
+                        iframe_loc.get_attribute("src"), timeout=2.0
+                    ) or ""
                     if new_src and new_src != old_iframe_src:
                         logger.info("Iframe src changed — new content loading")
                         src_changed = True
                         break
-            except Exception:
+            except (asyncio.TimeoutError, Exception):
                 pass
             await asyncio.sleep(0.5)
 
