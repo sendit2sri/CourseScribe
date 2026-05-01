@@ -66,6 +66,19 @@ _LOGIN_URL_PATTERNS = (
     "accounts.google.com",
 )
 
+
+def looks_like_login_url(url: str) -> bool:
+    """Cheap URL-only check for whether a page is a login/SSO redirect.
+
+    Used by callers (CLI multi-course loop, portal helpers) to fail fast
+    when the session has been bounced to login mid-run, without paying
+    the cost of a full is_session_valid() navigation+probe.
+    """
+    if not url:
+        return False
+    u = url.lower()
+    return any(p in u for p in _LOGIN_URL_PATTERNS)
+
 # Generic indicators that the user is logged in
 _LOGGED_IN_INDICATORS = (
     ".user-menu", ".profile-icon", ".logged-in",

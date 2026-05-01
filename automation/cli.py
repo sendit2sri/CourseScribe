@@ -394,9 +394,14 @@ async def _run_multi_course_loop(
     config: AutomationConfig, process_pages: bool
 ) -> None:
     """Main orchestration loop for processing multiple courses from targets.json."""
-    from automation.capture.browser import BrowserSession
+    from automation.capture.browser import BrowserSession, looks_like_login_url
     from automation.capture.navigator import CourseNavigator
-    from automation.capture.portal import CourseLaunchError, NavigationError, PortalNavigator
+    from automation.capture.portal import (
+        CourseLaunchError,
+        NavigationError,
+        PortalNavigator,
+        SessionExpiredError,
+    )
     from automation.capture.screenshot import ScreenshotCapture
     from automation.pipeline.classifier import ContentClassifier
     from automation.pipeline.processor import PageProcessor
@@ -416,6 +421,23 @@ async def _run_multi_course_loop(
 
     session = BrowserSession(config)
 
+    async def _navigate_to_pathway_courses(
+        portal: "PortalNavigator", pathway_targets, *, fresh: bool
+    ) -> None:
+        # First pathway: navigate from wherever we landed post-auth.
+        # Subsequent / recovery: jump back to the cached landing URL,
+        # then call navigate_to_pathways() as a safety net.
+        if fresh:
+            await portal.navigate_to_pathways()
+        else:
+            await portal.return_to_pathways_landing()
+            await portal.navigate_to_pathways()
+        if pathway_targets.category:
+            await portal.select_category_tab(pathway_targets.category)
+        await portal.select_pathway(pathway_targets.pathway_name)
+        await portal.expand_course_section()
+        session.save_as_portal_page()
+
     try:
         await session.start()
         await session.ensure_authenticated()
@@ -432,24 +454,10 @@ async def _run_multi_course_loop(
 
             portal = PortalNavigator(session, selectors, pathway_targets)
 
-            # First pathway: navigate from wherever we landed post-auth.
-            # Subsequent pathways: jump back to the cached landing URL, then
-            # call navigate_to_pathways() as a safety net (early-returns if
-            # already on the Pathways page).
-            if first_pathway:
-                await portal.navigate_to_pathways()
-                first_pathway = False
-            else:
-                await portal.return_to_pathways_landing()
-                await portal.navigate_to_pathways()
-
-            if pathway_targets.category:
-                await portal.select_category_tab(pathway_targets.category)
-            await portal.select_pathway(pathway_targets.pathway_name)
-            await portal.expand_course_section()
-
-            # Save portal page reference for tab management
-            session.save_as_portal_page()
+            await _navigate_to_pathway_courses(
+                portal, pathway_targets, fresh=first_pathway,
+            )
+            first_pathway = False
 
             # Pending list is built from THIS pathway only — never the whole file.
             pending = [
@@ -473,6 +481,23 @@ async def _run_multi_course_loop(
                 if _shutdown_requested:
                     logger.info("Shutdown requested, stopping after current course")
                     break
+
+                # Re-auth checkpoint: long unattended runs see the SSO session
+                # expire between courses. Cheap URL probe avoids the cost of a
+                # full is_session_valid() per course; if the portal page has
+                # been bounced to login, recover transparently. ensure_authenticated
+                # raises on terminal failure -> aborts the run (no operator).
+                portal_url = session.page.url if session.page else ""
+                if looks_like_login_url(portal_url):
+                    logger.warning(
+                        "Portal page is on a login URL between courses (%s) — "
+                        "re-authenticating",
+                        portal_url,
+                    )
+                    await session.ensure_authenticated()
+                    await _navigate_to_pathway_courses(
+                        portal, pathway_targets, fresh=False,
+                    )
 
                 print(f"\n{'=' * 60}")
                 print(f"Starting: {course_name}")
@@ -616,6 +641,31 @@ async def _run_multi_course_loop(
                         await portal.expand_course_section()
                     except Exception:
                         logger.debug("Could not re-expand course section (may still be visible)")
+
+                except SessionExpiredError as e:
+                    # Session expired mid-course-open. Mark this course failed,
+                    # re-authenticate, re-establish the pathway view, then
+                    # continue. ensure_authenticated raises RuntimeError on
+                    # terminal failure, which propagates and aborts the run.
+                    logger.warning(
+                        "Session expired during '%s': %s — re-authenticating",
+                        course_name, e,
+                    )
+                    courses_state.mark_failed(course_name, f"session_expired: {e}")
+                    courses_state.save()
+
+                    # Best-effort tab cleanup before re-auth
+                    try:
+                        await session.close_current_page()
+                        await session.switch_to_portal_page()
+                    except Exception:
+                        pass
+
+                    await session.ensure_authenticated()
+                    await _navigate_to_pathway_courses(
+                        portal, pathway_targets, fresh=False,
+                    )
+                    continue
 
                 except (NavigationError, CourseLaunchError) as e:
                     logger.error("Course failed: %s: %s", course_name, e)

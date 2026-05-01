@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Frame, Locator, Page
 
-from automation.capture.browser import BrowserSession
+from automation.capture.browser import BrowserSession, looks_like_login_url
 from automation.config import TargetsConfig
 from automation.selectors import SelectorProfile
 
@@ -42,6 +42,11 @@ class NavigationError(Exception):
 
 class CourseLaunchError(NavigationError):
     """Raised when the course launch sequence fails."""
+
+
+class SessionExpiredError(NavigationError):
+    """Raised when a portal helper detects the page has been bounced
+    to a login/SSO URL. Caller should re-authenticate and retry."""
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +265,10 @@ class PortalNavigator:
         Only clicks if currently collapsed (angle-down visible).
         """
         page = self.session.page
+        if looks_like_login_url(page.url):
+            raise SessionExpiredError(
+                f"Cannot expand course section: page is on a login URL ({page.url})"
+            )
         logger.info("Expanding course section...")
 
         for selector in self.selectors.get_chain("pathway_dropdown_toggle"):
@@ -424,8 +433,15 @@ class PortalNavigator:
         If the course isn't listed on the current pathway page, falls back
         to the portal's global search (when a course_code is provided).
         """
+        page = self.session.page
+        if looks_like_login_url(page.url):
+            raise SessionExpiredError(
+                f"Cannot open course '{course_name}': page is on a login URL ({page.url})"
+            )
         try:
             link = await self.find_course_link(course_name, course_code=course_code)
+        except SessionExpiredError:
+            raise
         except NavigationError as pathway_error:
             if not course_code:
                 raise
@@ -436,6 +452,8 @@ class PortalNavigator:
             try:
                 await self.open_course_via_global_search(course_code)
                 return
+            except SessionExpiredError:
+                raise
             except Exception as search_error:
                 raise NavigationError(
                     f"Failed to open course '{course_name}' ({course_code}) via "
@@ -457,6 +475,11 @@ class PortalNavigator:
             await link.click()
 
         await self.session.click_and_wait_for_new_tab(_click)
+        if looks_like_login_url(self.session.page.url):
+            raise SessionExpiredError(
+                f"Course tab for '{course_name}' redirected to login "
+                f"({self.session.page.url})"
+            )
         logger.info("Opened course in new tab: %s", course_name)
 
     # ------------------------------------------------------------------
@@ -480,6 +503,11 @@ class PortalNavigator:
 
         if not trigger_sel or not result_sel:
             raise NavigationError("Global search selectors not configured")
+
+        if looks_like_login_url(page.url):
+            raise SessionExpiredError(
+                f"Cannot run global search: page is on a login URL ({page.url})"
+            )
 
         trigger = page.locator(trigger_sel).first
         if await trigger.count() == 0:
@@ -585,6 +613,10 @@ class PortalNavigator:
             await page.evaluate("(u) => window.open(u, '_blank')", url)
 
         await self.session.click_and_wait_for_new_tab(_open)
+        if looks_like_login_url(self.session.page.url):
+            raise SessionExpiredError(
+                f"Course URL {url} redirected to login ({self.session.page.url})"
+            )
         logger.info("Opened course in new tab via direct URL: %s", url)
 
     async def _log_available_courses(self, page: Page) -> None:
