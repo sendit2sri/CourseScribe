@@ -132,15 +132,16 @@ def _validate_pathways(pathways: List[TargetsConfig], source: Path) -> None:
 
 DEFAULT_BROWSER_DATA_DIR = Path.home() / ".coursescribe" / "browser_profile"
 DEFAULT_OUTPUT_DIR = Path("course_capture")
-DEFAULT_PAGE_DELAY = 3.0
+DEFAULT_PAGE_DELAY = 1.0
 DEFAULT_VIEWPORT_WIDTH = 1920
 DEFAULT_VIEWPORT_HEIGHT = 1080
-DEFAULT_STABLE_WAIT_MS = 30000
+DEFAULT_STABLE_WAIT_MS = 8000
 DEFAULT_MUTATION_QUIET_MS = 500
 DEFAULT_IDLE_PAUSE_INTERVAL_MIN = 15
 DEFAULT_IDLE_PAUSE_INTERVAL_MAX = 30
 DEFAULT_IDLE_PAUSE_DURATION_MIN = 120.0
 DEFAULT_IDLE_PAUSE_DURATION_MAX = 300.0
+DEFAULT_ITEM_LAUNCH_TIMEOUT = 180.0
 
 # Minimum OCR char count below which a page is flagged for review
 LOW_QUALITY_CHAR_THRESHOLD = 50
@@ -212,6 +213,10 @@ class AutomationConfig:
 
     # Pacing — session batching
     batch_size: int = 0  # 0 = disabled; auto-stop after N pages
+
+    # Watchdog — hard cap on per-item launch + first-capture readiness.
+    # If exceeded, the item is marked failed_launch and the run advances.
+    item_launch_timeout: float = DEFAULT_ITEM_LAUNCH_TIMEOUT
 
     # Quality
     low_quality_char_threshold: int = LOW_QUALITY_CHAR_THRESHOLD
@@ -296,6 +301,8 @@ class AutomationConfig:
             errors.append("--idle-pause-duration min must be <= max")
         if self.batch_size < 0:
             errors.append("--batch-size must be non-negative")
+        if self.item_launch_timeout <= 0:
+            errors.append("--item-launch-timeout must be positive")
 
         if self.selectors_file and not self.selectors_file.exists():
             errors.append(f"Selectors file not found: {self.selectors_file}")
