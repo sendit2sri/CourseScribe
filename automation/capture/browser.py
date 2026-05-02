@@ -427,11 +427,65 @@ class BrowserSession:
             return
 
         logger.info("Session expired — attempting re-login")
-        # Navigate to login page
-        login_url = self.config.effective_login_url
-        if login_url:
-            await self._page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1)
+
+        # Where is the actual login form?
+        #
+        # is_session_valid() navigates to start_url and lets the SSO redirect
+        # chain complete (networkidle + 3s settle). When it returns False the
+        # browser is sitting on the real login form (often an IdP page reached
+        # via SAML, NOT the Cornerstone /login/render.aspx launcher).
+        #
+        # The previous implementation immediately did goto(effective_login_url),
+        # which navigated AWAY from that form and only waited 1s — too short
+        # for the SAML chain to relaunch. _try_auto_login then probed an
+        # in-flight intermediate page and reported "Username field not found".
+        #
+        # Resolution rules (with explicit logging for each branch):
+        #   1. Already on a login URL -> stay put, skip the goto.
+        #   2. URL is empty / about:blank / not a login URL -> navigate to
+        #      start_url (same URL is_session_valid used and proved works).
+        #   3. start_url unset -> fall back to effective_login_url.
+        current_url = self._page.url or ""
+        is_blank = (not current_url) or current_url == "about:blank"
+
+        if not is_blank and looks_like_login_url(current_url):
+            logger.info(
+                "Session invalid; already on login page, skipping navigation (%s)",
+                current_url,
+            )
+        else:
+            target_url = self.config.start_url or self.config.effective_login_url
+            if not target_url:
+                logger.warning(
+                    "Session invalid but no start_url or login_url configured — "
+                    "cannot navigate to login form"
+                )
+            elif self.config.start_url:
+                logger.info(
+                    "Session invalid; navigating to start_url for re-auth (%s)",
+                    target_url,
+                )
+                await self._page.goto(
+                    target_url, wait_until="domcontentloaded", timeout=30000,
+                )
+            else:
+                logger.info(
+                    "start_url unavailable; falling back to login_url (%s)",
+                    target_url,
+                )
+                await self._page.goto(
+                    target_url, wait_until="domcontentloaded", timeout=30000,
+                )
+
+        # Match is_session_valid's settle so the SSO redirect chain has time
+        # to land on the real form before _try_auto_login probes for fields.
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            logger.debug(
+                "networkidle timeout during re-auth settle — continuing anyway"
+            )
+        await asyncio.sleep(3)
 
         # Try auto-login first, then manual fallback
         if self.config.has_credentials:
